@@ -1,6 +1,6 @@
 
 
-# tumblrpx - A fast, modern alternative to tumblrpx.com
+# tumblrpx - A fast, modern tumblr version of redditpx.com
 
 tuumblrpx is a fast & fun way to make slideshows out of reddit.
 
