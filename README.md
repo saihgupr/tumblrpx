@@ -2,7 +2,7 @@
 
 # tumblrpx - A fast, modern tumblr version of redditpx.com
 
-tuumblrpx is a fast & fun way to make slideshows out of reddit.
+tumblrpx is a fast & fun way to make slideshows out of tumblr.
 
 ## Getting Started
 
