@@ -1,0 +1,81 @@
+{
+  "bundler": "rollup",
+  "shimport": "2.0.5",
+  "assets": {
+    "main": "client.a43d5018.js"
+  },
+  "css": {},
+  "dependencies": {
+    "index.svelte": [
+      "index.17545acc.js",
+      "FullscreenLayout.c0f94fa5.js",
+      "Settings.852120e8.js",
+      "faHome.427244be.js",
+      "faEye.6682d2c6.js",
+      "inject_styles.803b7e80.js",
+      "Settings-c3c9ceed.css",
+      "FullscreenLayout-f99c71f6.css"
+    ],
+    "download.svelte": [
+      "download.205c905c.js",
+      "Settings.852120e8.js",
+      "faHome.427244be.js",
+      "inject_styles.803b7e80.js",
+      "Settings-c3c9ceed.css",
+      "download-e99390f9.css"
+    ],
+    "health.svelte": [
+      "health.6004466c.js",
+      "inject_styles.803b7e80.js",
+      "health-06d1a923.css"
+    ],
+    "search/[tag].svelte": [
+      "_tag_.5c0207e5.js",
+      "FullscreenLayout.c0f94fa5.js",
+      "Settings.852120e8.js",
+      "faHome.427244be.js",
+      "faEye.6682d2c6.js",
+      "inject_styles.803b7e80.js",
+      "Settings-c3c9ceed.css",
+      "FullscreenLayout-f99c71f6.css"
+    ],
+    "home.svelte": [
+      "home.3332f32e.js",
+      "Settings.852120e8.js",
+      "faEye.6682d2c6.js",
+      "inject_styles.803b7e80.js",
+      "Settings-c3c9ceed.css",
+      "home-a0c5c5b0.css"
+    ],
+    "user/[username].svelte": [
+      "_username_.030caae6.js",
+      "FullscreenLayout.c0f94fa5.js",
+      "Settings.852120e8.js",
+      "faHome.427244be.js",
+      "faEye.6682d2c6.js",
+      "inject_styles.803b7e80.js",
+      "Settings-c3c9ceed.css",
+      "FullscreenLayout-f99c71f6.css"
+    ],
+    "t/[slug]/index.svelte": [
+      "index.39f388e5.js",
+      "FullscreenLayout.c0f94fa5.js",
+      "Settings.852120e8.js",
+      "faHome.427244be.js",
+      "faEye.6682d2c6.js",
+      "inject_styles.803b7e80.js",
+      "Settings-c3c9ceed.css",
+      "FullscreenLayout-f99c71f6.css"
+    ],
+    "t/[slug]/[slug].svelte": [
+      "_slug_.4f369f68.js",
+      "FullscreenLayout.c0f94fa5.js",
+      "Settings.852120e8.js",
+      "faHome.427244be.js",
+      "faEye.6682d2c6.js",
+      "inject_styles.803b7e80.js",
+      "Settings-c3c9ceed.css",
+      "FullscreenLayout-f99c71f6.css"
+    ]
+  }
+}
