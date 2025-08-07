@@ -37,6 +37,7 @@
 
   import shuffle from "lodash.shuffle";
 
+  import { API_KEY } from "../config.js";
   import { get_tumblr_posts, queryp } from "../_tumblr_utils.ts";
 
   
@@ -58,7 +59,8 @@
     layout,
     multireddit,
     oldreddit,
-    hideUIonStart
+    hideUIonStart,
+    apiKey
   } from "../_prefs";
   autoplay.useLocalStorage(false);
   autoplayinterval.useLocalStorage(3);
@@ -75,10 +77,11 @@
   muted.useLocalStorage(true);
   layout.useLocalStorage(0);
   hideUIonStart.useLocalStorage(false);
+  apiKey.useLocalStorage('');
 
   export let params, slugstr;
-  export let posts;
-  export let after;
+  export let posts = [];
+  export let after = null;
   export let res;
   export let mode = "tumblr";
   export let pageType = "user";
@@ -167,7 +170,7 @@
   let index = 0;
 
   async function loadMore() {
-    if (!after) return;
+    if (loading) return;
 
     loading = true;
     reloadstr = "Loading ..";
@@ -175,11 +178,12 @@
     let newposts;
 
     if (mode === "tumblr") {
+      let useApiKey = $apiKey || API_KEY;
       let url;
       if (pageType === 'search') {
-        url = `https://api.tumblr.com/v2/tagged?tag=${blogIdentifier}&api_key=ru6b4z2sDMz7h0WyCULiNuqqgDfgubrdQZtZrVUkXQGkzFPTrF&before=${after}&${queryp(params)}`;
+        url = `https://api.tumblr.com/v2/tagged?tag=${blogIdentifier}&api_key=${useApiKey}&before=${after || ''}&${queryp(params)}`;
       } else {
-        url = `https://api.tumblr.com/v2/blog/${blogIdentifier}/posts?api_key=ru6b4z2sDMz7h0WyCULiNuqqgDfgubrdQZtZrVUkXQGkzFPTrF&offset=${after}&${queryp(params)}`;
+        url = `https://api.tumblr.com/v2/blog/${blogIdentifier}/posts?api_key=${useApiKey}&offset=${after || ''}&${queryp(params)}`;
       }
 
       ({
@@ -216,9 +220,7 @@
   }
 
   onMount(async () => {
-    console.log("Posts on mount:", posts);
-    console.log("Display Posts on mount:", displayposts);
-    loadMore(); // Call loadMore on mount
+    loadMore();
     // Start autoplay by default
     if ($autoplay) {
       startAutoPlay();
@@ -493,6 +495,13 @@
     }
 
     if ($autoplay) stopAndStartAutoPlay();
+  }
+
+  function reloadData() {
+    posts = [];
+    displayposts = [];
+    after = null;
+    loadMore();
   }
 
   function videoended() {
@@ -941,7 +950,7 @@
         <Icon icon="{faSettings}"></Icon>
       </span>
       <div class="div" class:hide="{uiVisible == false}">
-        <Settings bind:showSettings></Settings>
+        <Settings bind:showSettings on:apiKeyChange={reloadData}></Settings>
       </div>
     </div>
     <div class="main-media-container">

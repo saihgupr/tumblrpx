@@ -53,3 +53,4 @@ export const layout = store("layout");
 export const oldreddit = store("oldreddit");
 export const multireddit = store("multireddit");
 export const hideUIonStart = store("hideUIonStart");
+export const apiKey = store("apiKey");

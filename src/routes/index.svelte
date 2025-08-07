@@ -1,11 +1,12 @@
 <script context="module">
+  import { API_KEY } from '../config.js';
   export async function preload({ path, params, query }) {
     if (typeof window === "undefined") return;
 
     let slugstr = query.user || "cheezbot";
 
     let { posts, res, after } = await get_tumblr_posts(
-      `https://api.tumblr.com/v2/blog/${slugstr}/posts?api_key=ru6b4z2sDMz7h0WyCULiNuqqgDfgubrdQZtZrVUkXQGkzFPTrF&${queryp(query)}`
+      `https://api.tumblr.com/v2/blog/${slugstr}/posts?api_key=${API_KEY}&${queryp(query)}`
     );
 
     return { posts, after, res, slugstr };

@@ -1,6 +1,5 @@
 <script context="module">
-  // TODO: Replace with your actual Tumblr API key
-  const API_KEY = 'ru6b4z2sDMz7h0WyCULiNuqqgDfgubrdQZtZrVUkXQGkzFPTrF';
+  import { API_KEY } from '../../config.js';
 
   export async function preload({ path, params, query }) {
     if (typeof window === "undefined") return;

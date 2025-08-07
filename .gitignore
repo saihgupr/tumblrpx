@@ -2,3 +2,4 @@
 node_modules/
 *.log
 .env
+src/config.js

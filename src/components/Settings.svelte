@@ -1,4 +1,7 @@
 <script>
+  import { createEventDispatcher } from 'svelte';
+  const dispatch = createEventDispatcher();
+
   import Icon from "fa-svelte/src/Icon.svelte";
   import { faCog as faSettings } from "@fortawesome/free-solid-svg-icons/faCog";
   import { faTimes as faClose } from "@fortawesome/free-solid-svg-icons/faTimes";
@@ -17,7 +20,8 @@
     imageVideo,
     portraitLandscape,
     muted,
-    hideUIonStart
+    hideUIonStart,
+    apiKey
   } from "../_prefs";
   autoplayinterval.useLocalStorage(3);
   scrollspeed.useLocalStorage(2);
@@ -31,6 +35,7 @@
   portraitLandscape.useLocalStorage(0);
   muted.useLocalStorage(true);
   hideUIonStart.useLocalStorage(true);
+  apiKey.useLocalStorage('');
 
   function hideSettings() {
     showSettings = false;
@@ -50,8 +55,15 @@
   let _imageVideo = $imageVideo;
   let _portraitLandscape = $portraitLandscape;
   let _hideUIonStart = $hideUIonStart;
+  let _apiKey = $apiKey;
 
   $: hideUIonStart.set(_hideUIonStart);
+  $: {
+    apiKey.set(_apiKey);
+    if (_apiKey) {
+      dispatch('apiKeyChange', _apiKey);
+    }
+  }
 
   let imagesVideoStates = [
     "Both images and videos",
@@ -178,6 +190,10 @@
           label.switch
             input(type="checkbox", bind:checked='{_hideUIonStart}')
             span.slider.round
+        .item
+          span.text Tumblr API Key
+          span.input
+            input(type="text", bind:value='{_apiKey}')
         //p remove duplicates
         //p aggressive caching (thumb vs preview)
       div.option(class:active='{activeTab == 2}')
