@@ -11,24 +11,13 @@
   import { faCloudDownloadAlt as faDownload } from "@fortawesome/free-solid-svg-icons/faCloudDownloadAlt";
   import { faDice } from "@fortawesome/free-solid-svg-icons/faDice";
   import { faPhotoVideo as faImageVideo } from "@fortawesome/free-solid-svg-icons/faPhotoVideo";
-  import { faImage } from "@fortawesome/free-solid-svg-icons/faImage";
   import { faVideo } from "@fortawesome/free-solid-svg-icons/faVideo";
-  import { faStar as faFav } from "@fortawesome/free-solid-svg-icons/faStar";
-  import { faStar as faUnFav } from "@fortawesome/free-regular-svg-icons/faStar";
+  import { faImage } from "@fortawesome/free-solid-svg-icons/faImage";
   import { faSearch } from "@fortawesome/free-solid-svg-icons/faSearch";
   import { faSync } from "@fortawesome/free-solid-svg-icons/faSync";
   import { faSpinner } from "@fortawesome/free-solid-svg-icons/faSpinner";
-  import { faPlusCircle } from "@fortawesome/free-solid-svg-icons/faPlusCircle";
-  import { faMinusCircle } from "@fortawesome/free-solid-svg-icons/faMinusCircle";
-  import { faEye as faShow } from "@fortawesome/free-solid-svg-icons/faEye";
-  import { faEyeSlash as faHide } from "@fortawesome/free-solid-svg-icons/faEyeSlash";
-  import { faTh as faColumns } from "@fortawesome/free-solid-svg-icons/faTh";
-  import { faExpandArrowsAlt as faFullscreen } from "@fortawesome/free-solid-svg-icons/faExpandArrowsAlt";
 
-  import { faMobileAlt as faPortrait } from "@fortawesome/free-solid-svg-icons/faMobileAlt";
-  import { faDesktop as faLandscape } from "@fortawesome/free-solid-svg-icons/faDesktop";
-
-  import AutoComplete from "simple-svelte-autocomplete";
+  // AutoComplete import removed - not used
 
   import Settings from "./Settings.svelte";
 
