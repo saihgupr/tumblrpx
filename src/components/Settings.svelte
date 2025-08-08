@@ -102,50 +102,42 @@
 
   function toggleOldReddit() {
     _oldreddit = !_oldreddit;
-
     oldreddit.set(_oldreddit);
   }
 
   function toggleImageVideo() {
     _imageVideo = _imageVideo + 1;
-
     if (_imageVideo == 3) {
       _imageVideo = 0;
     }
-
     imageVideo.set(_imageVideo);
   }
+  
   function togglePortraitLandscape() {
     _portraitLandscape = _portraitLandscape + 1;
-
     if (_portraitLandscape == 3) {
       _portraitLandscape = 0;
     }
-
     portraitLandscape.set(_portraitLandscape);
   }
 
   function toggleHiRes() {
     _hires = !_hires;
-
     hires.set(_hires);
   }
 
   function toggleLoRes() {
     _lores = !_lores;
-
     lores.set(_lores);
   }
 
   function toggleMuted() {
     _muted = !_muted;
-
     muted.set(_muted);
   }
 
   function toggleHideUIonStart() {
     _hideUIonStart = !_hideUIonStart;
-
     hideUIonStart.set(_hideUIonStart);
   }
 </script>
@@ -163,69 +155,56 @@
       div(class:active='{activeTab == 2}', on:click='{function(){activeTab = 2}}') Keybindings
     .options
       div.option(class:active='{activeTab == 1}')
-        //p autoplay on/off
-        //p download files
-        //p nsfw on/off
         .item
-          span.text Autoplay time (seconds)
+          span.text Autoplay Duration (seconds)
           span.input
-            input(type="number", bind:value='{_autoplayinterval}')
+            input(type="number", bind:value='{_autoplayinterval}', min="0", max="60")
         .item
-          span.text Scroll speed (0-20)
+          span.text Scroll Speed (0-20)
           span.input
-            input(type="number", bind:value='{_scrollspeed}')
-        //.item
-        //  span Favorite
-        //    span
-        //      span.button Mark all
-        //      span.button Unmark all
-        //      span.button Unmark all (all subreddits)
+            input(type="number", bind:value='{_scrollspeed}', min="0", max="20")
         .item
-          span.text Prefetch items
+          span.text Prefetch Count
           span.input
-            input(type="number", bind:value='{_prefetchNum}')
-        
+            input(type="number", bind:value='{_prefetchNum}', min="1", max="200")
         .item
-          span.text Hide UI on start
+          span.text Hide UI on Startup
           label.switch
             input(type="checkbox", bind:checked='{_hideUIonStart}')
             span.slider.round
         .item
           span.text Tumblr API Key
           span.input
-            input(type="text", bind:value='{_apiKey}', placeholder="OAuth Consumer Key")
+            input(type="text", bind:value='{_apiKey}', placeholder="Enter your OAuth Consumer Key")
           .api-key-help
-            a(href="https://www.tumblr.com/oauth/apps", target="_blank") Make One Here
-        //p remove duplicates
-        //p aggressive caching (thumb vs preview)
+            a(href="https://www.tumblr.com/oauth/apps", target="_blank") Get API Key Here
       div.option(class:active='{activeTab == 2}')
         .item
           span.text Play / Pause
           span.key q
           span.key p
         .item
-          span.text Next item
+          span.text Next Item
           span.key Space
           span.key Right
           span.key d
           span.key j
           span.key Page-down
         .item
-          span.text Previous item
+          span.text Previous Item
           span.key Left
           span.key a
           span.key k
           span.key Page-up
         .item
-          span.text Next item in the album
+          span.text Next Album Item
           span.key Up
         .item
-          span.text Previous item in the album
+          span.text Previous Album Item
           span.key Down
         .item
-          span.text Hide UI / Controls
+          span.text Toggle UI
           span.key h
-        
         .item
           span.text Toggle Sound
           span.key s
@@ -236,12 +215,11 @@
 
 <style lang="sass">
 @mixin hover()
-  @media not all and (pointer:coarse)
+  @media not all and (pointer: coarse)
     &:hover
       @content
 
-$yellow: #f9ab00
-
+$yellow: #00b4d8
 $text-color: #fafafa
 $accent-color: white
 $favorite-color: #fbbc04
@@ -251,272 +229,271 @@ $over18-border-color: #ea4335
 
 .settingspanel
   position: fixed
-  background-color: black
-  left: 25%
-  top: 25%
-  width: 50%
-  height: 50%
-  border-radius: 5px
-  border: 1px solid white
-  padding: 1rem
+  background-color: #1a1a1a
+  left: 50%
+  top: 50%
+  transform: translate(-50%, -50%)
+  width: 800px
+  height: 520px
+  border-radius: 12px
+  border: none
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4)
+  backdrop-filter: blur(20px)
+  padding: 0
   display: none
+  overflow: hidden
+  z-index: 9999
 
-  grid-template-rows: [head-start] 2.5rem [head-end contents-start] 2fr [contents-end]
+  grid-template-rows: [head-start] 60px [head-end contents-start] 1fr [contents-end]
 
   &.showSettings
     display: grid
-    grid-gap: 1rem
+    grid-gap: 0
+
+  .head
+    grid-row: head
+    display: flex
+    align-items: center
+    justify-content: center
+    background-color: #222
+    color: #fff
+    font-size: 18px
+    font-weight: 600
+    border-bottom: 1px solid #333
+    position: relative
+
+    :global(svg)
+      margin-right: 10px
+      width: 20px
+      height: 20px
+
+  .close
+    position: absolute
+    top: 15px
+    right: 20px
+    color: #888
+    cursor: pointer
+    width: 30px
+    height: 30px
+    display: flex
+    align-items: center
+    justify-content: center
+    border-radius: 6px
+    transition: all 0.2s ease
+
+    @include hover()
+      background-color: #333
+      color: #fff
+
+    :global(svg)
+      width: 16px
+      height: 16px
 
   .contents
     grid-row: contents
     display: grid
-    grid-template-columns: 1fr 2fr
+    grid-template-columns: 180px 1fr
     overflow: hidden
     user-select: none
+    background-color: #1a1a1a
 
     .nav
-      font-size: 1.1rem
-
-      display: grid
-      grid-auto-rows: max-content
-      grid-gap: 5px
-
-      align-items: center
-      justify-items: center
-
-      // flow items one below other
-      grid-auto-flow: row
-
-      .active
-        background-color: rgba(255, 255, 255, 0.2)
-        border-bottom: 3px solid $accent-color
+      font-size: 14px
+      font-weight: 400
+      background-color: #222
+      border-right: 1px solid #333
+      padding: 20px 0
+      display: flex
+      flex-direction: column
+      gap: 0
+      align-items: stretch
 
       div
-        padding: 0.5rem 1rem
-        border-bottom: 3px solid rgba(0, 0, 0, 0)
-        width: 100%
-        height: 100%
+        padding: 12px 20px
         cursor: pointer
+        transition: all 0.2s ease
+        color: #ccc
+        border-left: 3px solid transparent
 
         @include hover()
-          background-color: rgba(255, 255, 255, 0.2)
-          border-bottom: 3px solid $accent-color
+          background-color: #2a2a2a
+          color: #fff
+
+        &.active
+          background-color: #2a2a2a
+          color: #fff
+          border-left-color: $yellow
 
     .options
-      background-color: rgba(black, 0%)
-      border-left: 1px solid white
-      overflow: auto
+      background-color: #1a1a1a
+      border-left: none
+      overflow-y: auto
+      padding: 15px 20px 10px 20px
+      max-height: 100%
 
       .option
         display: none
-        padding: 0rem 1rem
+
+        &.active
+          display: block
 
         .item
-          padding: 0.5rem
-          margin: 0.5rem 0
+          padding: 8px 0
+          margin: 0
+          border-bottom: 1px solid #333
+          display: flex
+          align-items: center
+          justify-content: flex-start
+          min-height: 40px
+          flex-wrap: wrap
+          gap: 20px
+
+          &:last-child
+            border-bottom: none
 
           .text
-            margin-right: 10px
+            color: #fff
+            font-size: 14px
+            font-weight: 400
+            min-width: 200px
+            white-space: nowrap
+            flex-shrink: 0
 
           .key
-            color: $yellow
+            color: #ccc
             margin: 0 4px
-            border: 1px solid $yellow
-            border-radius: 3px
-            padding: 4px 5px
-
-          .input
-            input
-              border: 1px solid white
-              background-color: rgba(black, 0)
-              color: white
-              padding: 5px
-              width: 100px
+            border: 1px solid #555
+            border-radius: 6px
+            padding: 6px 8px
+            font-size: 12px
+            font-weight: 500
+            white-space: nowrap
 
           .api-key-help
-            margin-top: 5px
-            font-size: 0.8rem
+            margin: 0
+            font-size: 12px
+            flex-shrink: 0
             
             a
               color: $yellow
               text-decoration: none
+              transition: all 0.2s ease
               
               @include hover()
                 text-decoration: underline
+                opacity: 0.8
+
+          .input
+            display: flex
+            flex-direction: column
+            align-items: flex-start
+            min-width: 300px
+            flex-shrink: 0
+            gap: 5px
+
+            input
+              border: 1px solid #444
+              background-color: #2a2a2a
+              color: #fff
+              padding: 8px 12px
+              border-radius: 6px
+              width: 300px
+              font-size: 14px
+              transition: all 0.2s ease
+              
+              &:focus
+                outline: none
+                border-color: $yellow
+                box-shadow: 0 0 0 2px rgba(0, 180, 216, 0.2)
+              
+              &[type="number"]
+                width: 100px
 
           .button
-            border: 1px solid white
+            border: 1px solid #444
+            background-color: #2a2a2a
             margin: 0 5px
-            padding: 5px
-            border-radius: 3px
+            padding: 8px 12px
+            border-radius: 6px
             cursor: pointer
+            color: #fff
+            transition: all 0.2s ease
 
             @include hover()
-              background-color: white
-              color: black
+              background-color: #333
+              border-color: #555
 
-      .active
-        display: block
+  .switch
+    position: relative
+    display: inline-block
+    width: 50px
+    height: 24px
 
-  .close
-    position: absolute
-    top: 1rem
-    color: rgba(white, 60%)
-    cursor: pointer
-    right: 1rem
+    input
+      opacity: 0
+      width: 0
+      height: 0
 
-    @include hover()
-      color: white
+    .slider
+      position: absolute
+      cursor: pointer
+      top: 0
+      left: 0
+      right: 0
+      bottom: 0
+      background-color: #444
+      transition: 0.3s
+      border-radius: 24px
 
-  .head
-    font-size: 1.5rem
-    align-self: center
+      &:before
+        position: absolute
+        content: ""
+        height: 18px
+        width: 18px
+        left: 3px
+        bottom: 3px
+        background-color: white
+        transition: 0.3s
+        border-radius: 50%
 
-    :global(svg)
-      position: relative
-      top: 3px
-      margin-right: 10px
+    input:checked + .slider
+      background-color: $yellow
 
-  @media (max-width: 1600px)
-    width: 80%
-    left: 10%
+    input:focus + .slider
+      box-shadow: 0 0 1px $yellow
 
-  @media (max-width: 1000px)
-    width: 90%
-    left: 5%
+    input:checked + .slider:before
+      transform: translateX(26px)
 
-  @media (max-width: 800px)
+    &.round .slider
+      border-radius: 24px
 
-    .contents
-      grid-template-rows: 3rem auto
-      grid-template-columns: unset
+      &:before
+        border-radius: 50%
 
-      .nav
-        // flow items to the right
-        grid-auto-flow: column
-        grid-auto-rows: unset
-        grid-auto-columns: max-content
+@media (max-width: 800px)
+  .settingspanel
+    width: 90vw
+    height: 80vh
+    max-width: 600px
+    max-height: 500px
 
-      .options
-        border-left-width: 0px
-        border-top: 1px solid white
+  .contents
+    grid-template-columns: 150px 1fr
 
-        .option
-          padding: 0
+  .options
+    padding: 20px
 
-.tooltip
-  position: relative
-  z-index: 2
-  cursor: pointer
+  .item
+    flex-direction: column
+    align-items: flex-start
+    gap: 10px
 
-.ttbefore
-  position: absolute
-  bottom: 120%
-  left: 50%
-  margin-bottom: 5px
-  margin-left: -30px
-  padding: 5px 4px
-  width: max-content
-  border-radius: 3px
-  background-color: black
-  color: #fff
+    .input
+      align-items: flex-start
+      width: 100%
 
-  background-color: rgba(white, 90%)
-  color: black
-
-  content: attr(data-tooltip)
-  text-align: center
-  font-size: 0.8rem
-  line-height: 1.2
-
-.ttafter
-  position: absolute
-  bottom: 120%
-  left: 50%
-  margin-left: -5px
-  width: 0
-  border-top: 5px solid rgba(white, 90%)
-  border-right: 5px solid transparent
-  border-left: 5px solid transparent
-  content: " "
-  font-size: 0
-  line-height: 0
-
-.tooltip
-  &:before, &:after
-    visibility: hidden
-    opacity: 0
-    pointer-events: none
-
-  &:before
-    @extend .ttbefore
-
-  &.bottom:before
-    @extend .ttbefore
-    bottom: -170%
-
-  &:after
-    @extend .ttafter
-
-  &.bottom:after
-    @extend .ttafter
-    bottom: -40%
-    border-bottom: 5px solid rgba(white, 90%)
-    border-top: 5px solid transparent
-
-  &:hover
-    &:before, &:after
-      visibility: visible
-      opacity: 1
-
-.switch 
-  position: relative
-  display: inline-block
-  width: 34px
-  height: 20px
-
-.switch input 
-  opacity: 0
-  width: 0
-  height: 0
-
-.slider 
-  position: absolute
-  cursor: pointer
-  top: 0
-  left: 0
-  right: 0
-  bottom: 0
-  background-color: #ccc
-  -webkit-transition: .4s
-  transition: .4s
-
-.slider:before 
-  position: absolute
-  content: ""
-  height: 14px
-  width: 14px
-  left: 3px
-  bottom: 3px
-  background-color: white
-  -webkit-transition: .4s
-  transition: .4s
-
-input:checked + .slider 
-  background-color: #2196F3
-
-input:focus + .slider 
-  box-shadow: 0 0 1px #2196F3
-
-input:checked + .slider:before 
-  -webkit-transform: translateX(14px)
-  -ms-transform: translateX(14px)
-  transform: translateX(14px)
-
-.slider.round 
-  border-radius: 20px
-
-.slider.round:before 
-  border-radius: 50%
-
+      input
+        width: 100%
+        max-width: 300px
 </style>

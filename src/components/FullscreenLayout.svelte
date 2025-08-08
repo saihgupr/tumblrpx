@@ -220,11 +220,7 @@
   }
 
   onMount(async () => {
-    if (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey) {
-      showSettings = true;
-      currpost = { title: "Please set your Tumblr API key in settings" };
-      return; // Don't load data if no API key
-    }
+    // Always try to load data on mount, regardless of API key status
     loadMore();
     // Start autoplay by default
     if ($autoplay) {
@@ -437,19 +433,21 @@
         // Check if it's an API key error
         console.log("API Error Response:", res);
         
-        // Check for various API key error patterns
+        // Handle API errors with helpful messaging
         const errorMessage = res.res.res || res.res || "";
+        
+        // Check if it's an API key error
         const isApiKeyError = errorMessage.includes("Invalid API key") || 
                              errorMessage.includes("OAuth Consumer Key Goes Here") ||
                              errorMessage.includes("api_key") ||
                              (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey);
         
         if (isApiKeyError) {
-          showSettings = true;
           currpost = { title: "Please set your Tumblr API key in settings" };
+          // Optionally show settings, but don't force it
+          // showSettings = true; // Uncomment this line if you want settings to open automatically
         } else {
-          // Other API errors
-          currpost = { title: "Error" };
+          currpost = { title: "Error loading posts" };
         }
       } else {
         // Default
@@ -496,25 +494,12 @@
     displayposts = tmp;
   }
 
-  // Watch for API key changes and reload data when a valid key is set
-  $: if ($apiKey && $apiKey !== '' && posts.length === 0 && !loading) {
-    // Only reload if we have a valid API key, no posts loaded, and not currently loading
-    if (API_KEY !== 'OAuth Consumer Key Goes Here' || $apiKey) {
-      reloadData();
-    }
-  }
+  // API key changes are handled manually by the user
+  // No automatic reloading or settings popup
 
-  // Watch for missing API key and show appropriate message
-  $: if (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey && posts.length === 0) {
-    currpost = { title: "Please set your Tumblr API key in settings" };
-    showSettings = true;
-  }
-
-  // Also check if we have any posts but no valid API key (fallback)
-  $: if (posts.length === 0 && !loading && (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey)) {
-    currpost = { title: "Please set your Tumblr API key in settings" };
-    showSettings = true;
-  }
+  // Only show settings if we have no valid API key AND no posts loaded
+  // Settings window will only appear when user manually clicks the settings button
+  // No automatic popup on refresh or load
 
   function goto(i) {
     albumindex = 0;
@@ -538,11 +523,7 @@
   }
 
   function reloadData() {
-    // Check if we have a valid API key before loading data
-    if (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey) {
-      showSettings = true;
-      return;
-    }
+    // Always reload data, let the API handle errors
     posts = [];
     displayposts = [];
     after = null;
@@ -1083,7 +1064,13 @@
             class:dlready="{numFavorite}"
           >
             {#if filterExpanded}
-              <input bind:value="{filterValue}" on:click|stopPropagation on:keydown|stopPropagation type="text">
+              <input 
+                bind:value="{filterValue}" 
+                on:click|stopPropagation 
+                on:keydown|stopPropagation 
+                type="text"
+                placeholder="Filter posts..."
+              >
             {:else}
               <Icon icon="{faSearch}"></Icon>
             {/if}
@@ -1176,7 +1163,7 @@
     &:hover
       @content
 
-$yellow: #f9ab00
+$yellow: #00b4d8
 
 $text-color: #fafafa
 $accent-color: white
@@ -1212,22 +1199,21 @@ $isnotmulti-color: #34a853
       z-index: 10
       position: absolute
       left: 1rem
-      top: 0
-      background-color: rgba(0, 0, 0, 0.4)
+      top: 1rem
+      background-color: rgba(26, 26, 26, 0.95)
+      backdrop-filter: blur(20px)
       color: $text-color
-      font-size: 1.5rem
+      font-size: 1.2rem
       max-width: 77%
-      padding: 1rem
-      border-radius: 3px
+      padding: 1rem 1.5rem
+      border-radius: 12px
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3)
 
     .settings
       z-index: 10
       position: absolute
-      top: 0
-      right: 0
-      color: $text-color
-      font-size: 1rem
-      padding: 1.5rem 2rem
+      top: 1rem
+      right: 1rem
 
     .main-media-container
       flex-grow: 1
@@ -1246,15 +1232,18 @@ $isnotmulti-color: #34a853
       user-select: none
       z-index: 5
       position: absolute
-      background-color: rgba(0, 0, 0, 0.6)
+      background-color: rgba(26, 26, 26, 0.7)
+      backdrop-filter: blur(20px)
       bottom: 0
       display: grid
-      grid-row-gap: 5px
-      padding: 1rem 11rem
-      border-radius: 3px
+      grid-row-gap: 8px
+      padding: 1.5rem 2rem
+      border-radius: 12px
+      margin: 1rem
       color: $text-color
-      width: 100%
-      grid-template-columns: repeat(auto-fill, minmax(32px, 1fr))
+      width: calc(100% - 2rem)
+      grid-template-columns: repeat(auto-fill, minmax(40px, 1fr))
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3)
 
       &.tinygoto
         grid-template-rows: auto 1fr
@@ -1273,17 +1262,25 @@ $isnotmulti-color: #34a853
 
           .nums
             border-bottom: 3px solid rgba(white, 30%)
-            height: 1rem
+            height: 32px
             cursor: pointer
+            border-radius: 4px
+            transition: all 0.2s ease
+            display: flex
+            align-items: center
+            justify-content: center
+            min-width: 40px
 
             @include hover()
-              border-bottom: 3px solid $accent-color !important
+              border-bottom: 3px solid $yellow !important
+              background-color: rgba(255, 255, 255, 0.1)
 
             &.currnum
-              border-bottom: 3px solid $accent-color !important
+              border-bottom: 3px solid $yellow !important
+              background-color: rgba(0, 180, 216, 0.2)
 
               &.album
-                border-bottom: 3px dotted $accent-color !important
+                border-bottom: 3px dotted $yellow !important
 
             &.favorite
               border-bottom: 3px solid $favorite-color
@@ -1309,8 +1306,9 @@ $isnotmulti-color: #34a853
 
         .displayinfo
           grid-column: span 1
-          font-size: 0.8rem
-          margin-top: 2px
+          font-size: 0.9rem
+          margin-top: 4px
+          color: rgba(255, 255, 255, 0.8)
 
           p
             margin: 0
@@ -1318,8 +1316,20 @@ $isnotmulti-color: #34a853
 
       .btn
         text-align: center
-        padding-top: 2px
-        color: rgba(white, 30%)
+        padding: 8px
+        color: rgba(white, 60%)
+        cursor: pointer
+        border-radius: 8px
+        transition: all 0.2s ease
+        display: flex
+        align-items: center
+        justify-content: center
+        min-width: 40px
+        height: 40px
+
+        @include hover()
+          color: white
+          background-color: rgba(255, 255, 255, 0.1)
 
         &.reload
           cursor: pointer
@@ -1327,25 +1337,21 @@ $isnotmulti-color: #34a853
           &.loaderror
             color: $over18-color
 
-          @include hover()
-            color: white
-
         &.deepsearch
           grid-column: span 4
-          bottom: 2px
           cursor: pointer
           justify-self: center
+          background-color: rgba(0, 180, 216, 0.1)
+          border: 1px solid rgba(0, 180, 216, 0.3)
 
-          &:hover p
-            color: $accent-color
-            border: 1px solid $accent-color
+          &:hover
+            background-color: rgba(0, 180, 216, 0.2)
+            border-color: rgba(0, 180, 216, 0.5)
 
           p
             margin: 0
             font-size: 0.9rem
-            color: darken($accent-color, 30%)
-            border: 1px solid darken($accent-color, 30%)
-            border-radius: 3px
+            color: $yellow
             padding: 0 1rem
 
         &.over18wrapper
@@ -1378,24 +1384,54 @@ $isnotmulti-color: #34a853
 
         &.imagevideo
           cursor: pointer
-          font-size: 1.4rem
-          bottom: 2px
+          font-size: 1.2rem
           color: white
 
         &.layout
           cursor: pointer
-          font-size: 1.4rem
-          bottom: 2px
+          font-size: 1.2rem
 
           &.active
             color: white
-            
+            background-color: rgba(0, 180, 216, 0.2)
 
         &.muted
           cursor: pointer
-          font-size: 1.4rem
-          bottom: 2px
+          font-size: 1.2rem
           color: white
+
+        &.filter
+          cursor: pointer
+          font-size: 1.2rem
+          color: white
+
+          input
+            background-color: rgba(42, 42, 42, 0.8)
+            border: 1px solid rgba(68, 68, 68, 0.8)
+            color: white
+            padding: 8px 12px
+            border-radius: 6px
+            font-size: 14px
+            outline: none
+            min-width: 200px
+
+            &:focus
+              border-color: $yellow
+              box-shadow: 0 0 0 2px rgba(0, 180, 216, 0.2)
+
+        &.cog
+          cursor: pointer
+          font-size: 1.2rem
+          color: white
+          background-color: rgba(26, 26, 26, 0.95)
+          backdrop-filter: blur(20px)
+          border-radius: 12px
+          transition: all 0.2s ease
+          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3)
+
+          @include hover()
+            background-color: rgba(34, 34, 34, 0.95)
+            transform: scale(1.05)
 
         &.portraitlandscape
           cursor: pointer
