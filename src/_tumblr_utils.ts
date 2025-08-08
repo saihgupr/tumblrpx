@@ -168,6 +168,17 @@ async function format_tumblr_post(post: TumblrPost): Promise<FormattedItem> {
 export async function get_tumblr_posts(url: string) {
   try {
     console.log("[get_tumblr_posts] API URL:", url);
+    
+    // Check if the URL contains the placeholder API key
+    if (url.includes('OAuth Consumer Key Goes Here')) {
+      console.log("[get_tumblr_posts]: Invalid API key detected");
+      return {
+        posts: [],
+        after: null,
+        res: { ok: false, res: "Invalid API key. Please set your Tumblr API key in settings." },
+      };
+    }
+    
     const res = await fetch(url);
     console.log("[get_tumblr_posts] Raw Response Object:", res);
     const data = await res.json();

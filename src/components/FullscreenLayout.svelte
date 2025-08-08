@@ -220,6 +220,10 @@
   }
 
   onMount(async () => {
+    if (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey) {
+      showSettings = true;
+      return; // Don't load data if no API key
+    }
     loadMore();
     // Start autoplay by default
     if ($autoplay) {
@@ -429,8 +433,14 @@
           title: "Nothing to show. Try changing filters or tweak/update URL."
         };
       } else if (res && !res.res.ok) {
-        // Invalid subreddit
-        currpost = { title: "Error" };
+        // Check if it's an API key error
+        if (res.res.res && res.res.res.includes("Invalid API key")) {
+          showSettings = true;
+          currpost = { title: "Please set your Tumblr API key in settings" };
+        } else {
+          // Other API errors
+          currpost = { title: "Error" };
+        }
       } else {
         // Default
         currpost = { title: "Loading .." };
@@ -476,6 +486,14 @@
     displayposts = tmp;
   }
 
+  // Watch for API key changes and reload data when a valid key is set
+  $: if ($apiKey && $apiKey !== '' && posts.length === 0 && !loading) {
+    // Only reload if we have a valid API key, no posts loaded, and not currently loading
+    if (API_KEY !== 'OAuth Consumer Key Goes Here' || $apiKey) {
+      reloadData();
+    }
+  }
+
   function goto(i) {
     albumindex = 0;
     index = i;
@@ -498,6 +516,11 @@
   }
 
   function reloadData() {
+    // Check if we have a valid API key before loading data
+    if (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey) {
+      showSettings = true;
+      return;
+    }
     posts = [];
     displayposts = [];
     after = null;
