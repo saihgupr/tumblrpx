@@ -193,7 +193,9 @@
         .item
           span.text Tumblr API Key
           span.input
-            input(type="text", bind:value='{_apiKey}')
+            input(type="text", bind:value='{_apiKey}', placeholder="OAuth Consumer Key")
+          .api-key-help
+            a(href="https://www.tumblr.com/oauth/apps", target="_blank") Make One Here
         //p remove duplicates
         //p aggressive caching (thumb vs preview)
       div.option(class:active='{activeTab == 2}')
@@ -330,6 +332,17 @@ $over18-border-color: #ea4335
               color: white
               padding: 5px
               width: 100px
+
+          .api-key-help
+            margin-top: 5px
+            font-size: 0.8rem
+            
+            a
+              color: $yellow
+              text-decoration: none
+              
+              @include hover()
+                text-decoration: underline
 
           .button
             border: 1px solid white
