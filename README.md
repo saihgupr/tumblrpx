@@ -10,8 +10,8 @@ tumblrpx is a fast & fun way to make slideshows out of tumblr.
 git clone https://github.com/saihgupr/redditpx.git
 cd redditpx
 ./setup.sh
-# Edit src/config.js with your Tumblr API key
 npm run dev
+# Click the settings gear icon (⚙️) and add your Tumblr API key
 ```
 
 ## Getting Started
@@ -37,22 +37,19 @@ You'll need [Node.js](https://nodejs.org/) and [npm](https://www.npmjs.com/get-n
    ```sh
    ./setup.sh
    ```
-4. Get a Tumblr API Key. You can get one by following these steps:
-   1. Go to [https://www.tumblr.com/oauth/apps](https://www.tumblr.com/oauth/apps) and click "Register a new application".
-   2. Fill out the application details. The "Application Website" and "Default callback URL" can be set to any valid URL, for example `https://localhost`.
-   3. Once registered, you will see your "OAuth Consumer Key". This is your API key.
-5. Edit `src/config.js` and replace the placeholder with your actual API key:
-   ```javascript
-   // src/config.js
-   export const API_KEY = 'YOUR_TUMBLR_API_KEY';
+4. Start the development server
+   ```sh
+   npm run dev
    ```
+5. Open http://localhost:3000 in your browser
+6. Click the settings gear icon (⚙️) and add your Tumblr API key
+7. Get a Tumblr API Key from [https://www.tumblr.com/oauth/apps](https://www.tumblr.com/oauth/apps)
 
 #### Manual Setup
 If you prefer to set up manually:
 1. Clone the repo and navigate to the project directory
 2. Install dependencies: `npm install`
-3. Copy the example config file: `cp src/config.example.js src/config.js`
-4. Edit `src/config.js` and add your Tumblr API key
+3. Run `npm run dev` and configure your API key through the settings UI
 
 ### Usage
 
