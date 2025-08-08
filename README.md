@@ -45,9 +45,9 @@ You'll need [Node.js](https://nodejs.org/) and [npm](https://www.npmjs.com/get-n
 6. Click the settings gear icon (⚙️) and add your Tumblr API key
 7. Get a Tumblr API Key from [https://www.tumblr.com/oauth/apps](https://www.tumblr.com/oauth/apps)
 
-![Tumblr API Key Setup](https://i.imgur.com/SeH15PO.png){: width="25%"}
+<img src="https://i.imgur.com/SeH15PO.png" alt="Tumblr API Key Setup" width="25%" />
 
-![Tumblr API Key Example](https://i.imgur.com/WHqB7AL.png){: width="25%"}
+<img src="https://i.imgur.com/WHqB7AL.png" alt="Tumblr API Key Example" width="25%" />
 
 #### Manual Setup
 If you prefer to set up manually:
