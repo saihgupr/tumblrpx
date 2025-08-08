@@ -5,6 +5,17 @@
 
     let slugstr = query.user || "cheezbot";
 
+    // Check if we have a valid API key before making the request
+    if (API_KEY === 'OAuth Consumer Key Goes Here') {
+      // Return empty data to let the client handle API key setup
+      return { 
+        posts: [], 
+        after: null, 
+        res: { ok: false, res: "Invalid API key. Please set your Tumblr API key in settings." }, 
+        slugstr 
+      };
+    }
+
     let { posts, res, after } = await get_tumblr_posts(
       `https://api.tumblr.com/v2/blog/${slugstr}/posts?api_key=${API_KEY}&${queryp(query)}`
     );

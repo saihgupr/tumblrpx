@@ -222,6 +222,7 @@
   onMount(async () => {
     if (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey) {
       showSettings = true;
+      currpost = { title: "Please set your Tumblr API key in settings" };
       return; // Don't load data if no API key
     }
     loadMore();
@@ -434,7 +435,16 @@
         };
       } else if (res && !res.res.ok) {
         // Check if it's an API key error
-        if (res.res.res && res.res.res.includes("Invalid API key")) {
+        console.log("API Error Response:", res);
+        
+        // Check for various API key error patterns
+        const errorMessage = res.res.res || res.res || "";
+        const isApiKeyError = errorMessage.includes("Invalid API key") || 
+                             errorMessage.includes("OAuth Consumer Key Goes Here") ||
+                             errorMessage.includes("api_key") ||
+                             (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey);
+        
+        if (isApiKeyError) {
           showSettings = true;
           currpost = { title: "Please set your Tumblr API key in settings" };
         } else {
@@ -492,6 +502,18 @@
     if (API_KEY !== 'OAuth Consumer Key Goes Here' || $apiKey) {
       reloadData();
     }
+  }
+
+  // Watch for missing API key and show appropriate message
+  $: if (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey && posts.length === 0) {
+    currpost = { title: "Please set your Tumblr API key in settings" };
+    showSettings = true;
+  }
+
+  // Also check if we have any posts but no valid API key (fallback)
+  $: if (posts.length === 0 && !loading && (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey)) {
+    currpost = { title: "Please set your Tumblr API key in settings" };
+    showSettings = true;
   }
 
   function goto(i) {
