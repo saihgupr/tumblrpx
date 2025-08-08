@@ -7,8 +7,8 @@ tumblrpx is a fast & fun way to make slideshows out of tumblr.
 ## 🚀 Quick Start
 
 ```bash
-git clone https://github.com/saihgupr/redditpx.git
-cd redditpx
+git clone https://github.com/saihgupr/tumblrpx.git
+cd tumblrpx
 ./setup.sh
 npm run dev
 # Click the settings gear icon (⚙️) and add your Tumblr API key
@@ -44,6 +44,8 @@ You'll need [Node.js](https://nodejs.org/) and [npm](https://www.npmjs.com/get-n
 5. Open http://localhost:3000 in your browser
 6. Click the settings gear icon (⚙️) and add your Tumblr API key
 7. Get a Tumblr API Key from [https://www.tumblr.com/oauth/apps](https://www.tumblr.com/oauth/apps)
+
+![Tumblr API Key Setup](https://i.imgur.com/SeH15PO.png)
 
 #### Manual Setup
 If you prefer to set up manually:
