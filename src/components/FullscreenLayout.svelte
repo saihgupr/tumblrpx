@@ -1296,7 +1296,7 @@ $isnotmulti-color: #34a853
         .displayinfo
           grid-column: span 1
           font-size: 0.9rem
-          margin-top: 4px
+          margin-top: 9px
           color: rgba(255, 255, 255, 0.8)
 
           p
