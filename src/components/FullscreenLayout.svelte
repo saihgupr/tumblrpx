@@ -1480,8 +1480,16 @@ $isnotmulti-color: #34a853
               background-color: rgba(0, 0, 0, 0)
               color: white
 
-      span
+      .nums
         position: relative
+        height: 40px
+        display: flex
+        align-items: center
+        justify-content: center
+        cursor: pointer
+        border-radius: 4px
+        transition: all 0.2s ease
+        min-width: 40px
 
         &.favorite
 
@@ -1504,7 +1512,7 @@ $isnotmulti-color: #34a853
             border-color: $over18-border-color
 
         p.small
-          margin: 0 2px
+          margin: 0
           text-align: center
           cursor: pointer
           border-bottom: 3px solid rgba(0, 0, 0, 0)

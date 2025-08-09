@@ -47,9 +47,9 @@ You'll need [Node.js](https://nodejs.org/) and [npm](https://www.npmjs.com/get-n
 
 **Example:**
 
-<img src="https://i.imgur.com/SeH15PO.png" alt="Tumblr API Key Setup" width="25%" />
+<img src="https://i.imgur.com/SeH15PO.png" alt="Tumblr API Key Setup" width="50%" />
 
-<img src="https://i.imgur.com/WHqB7AL.png" alt="Tumblr API Key Example" width="25%" />
+<img src="https://i.imgur.com/WHqB7AL.png" alt="Tumblr API Key Example" width="50%" />
 
 #### Manual Setup
 If you prefer to set up manually:
