@@ -1189,7 +1189,7 @@ $isnotmulti-color: #34a853
       position: absolute
       left: 1rem
       top: 1rem
-      background-color: rgba(26, 26, 26, 0.95)
+      background-color: rgba(26, 26, 26, 0.5)
       backdrop-filter: blur(20px)
       color: $text-color
       font-size: 1.2rem
@@ -1221,7 +1221,7 @@ $isnotmulti-color: #34a853
       user-select: none
       z-index: 5
       position: absolute
-      background-color: rgba(26, 26, 26, 0.7)
+      background-color: rgba(26, 26, 26, 0.5)
       backdrop-filter: blur(20px)
       bottom: 0
       display: grid
