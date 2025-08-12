@@ -1,6 +1,6 @@
 
 
-# 🎨 tumblrpx - Beautiful Tumblr Slideshow Viewer
+# tumblrpx - A fast, modern tumblr version of redditpx.com
 
 A fast, modern, and beautiful way to browse Tumblr posts as immersive slideshows. Built with Svelte/Sapper for lightning-fast performance. [tumblrpx.netlify.app](https://tumblrpx.netlify.app/)
 
