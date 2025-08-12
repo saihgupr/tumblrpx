@@ -2,7 +2,7 @@
 
 # 🎨 TumblrPX - Beautiful Tumblr Slideshow Viewer
 
-A fast, modern, and beautiful way to browse Tumblr posts as immersive slideshows. Built with Svelte/Sapper for lightning-fast performance.
+A fast, modern, and beautiful way to browse Tumblr posts as immersive slideshows. Built with Svelte/Sapper for lightning-fast performance. [Test it out here.](https://tumblrpx.netlify.app/)
 
 ![TumblrPX Screenshots](https://i.imgur.com/adWxaFB.jpeg)
 

@@ -2,71 +2,71 @@
   "bundler": "rollup",
   "shimport": "2.0.5",
   "assets": {
-    "main": "client.e786425c.js"
+    "main": "client.f78fef6e.js"
   },
   "css": {},
   "dependencies": {
     "index.svelte": [
-      "index.8af58648.js",
-      "FullscreenLayout.79611234.js",
-      "Settings.c1a6d999.js",
-      "faHome.a20aef62.js",
+      "index.bf2d8038.js",
+      "FullscreenLayout.164e5117.js",
+      "Settings.5d1191e4.js",
+      "faHome.6f4183a9.js",
       "inject_styles.803b7e80.js",
       "Settings-3c9e17f3.css",
       "FullscreenLayout-71f16396.css"
     ],
     "download.svelte": [
-      "download.94a0bf3c.js",
-      "Settings.c1a6d999.js",
-      "faHome.a20aef62.js",
+      "download.c03e8799.js",
+      "Settings.5d1191e4.js",
+      "faHome.6f4183a9.js",
       "inject_styles.803b7e80.js",
       "Settings-3c9e17f3.css",
       "download-3926ed88.css"
     ],
     "health.svelte": [
-      "health.dd44b9ed.js",
+      "health.dd335748.js",
       "inject_styles.803b7e80.js",
       "health-06d1a923.css"
     ],
     "search/[tag].svelte": [
-      "_tag_.799cc036.js",
-      "FullscreenLayout.79611234.js",
-      "Settings.c1a6d999.js",
-      "faHome.a20aef62.js",
+      "_tag_.a5c405cf.js",
+      "FullscreenLayout.164e5117.js",
+      "Settings.5d1191e4.js",
+      "faHome.6f4183a9.js",
       "inject_styles.803b7e80.js",
       "Settings-3c9e17f3.css",
       "FullscreenLayout-71f16396.css"
     ],
     "home.svelte": [
-      "home.685a35b5.js",
-      "Settings.c1a6d999.js",
+      "home.1ddbd5b8.js",
+      "Settings.5d1191e4.js",
       "inject_styles.803b7e80.js",
       "Settings-3c9e17f3.css",
       "home-04958cda.css"
     ],
     "user/[username].svelte": [
-      "_username_.22f83ca0.js",
-      "FullscreenLayout.79611234.js",
-      "Settings.c1a6d999.js",
-      "faHome.a20aef62.js",
+      "_username_.f823a2d5.js",
+      "FullscreenLayout.164e5117.js",
+      "Settings.5d1191e4.js",
+      "faHome.6f4183a9.js",
       "inject_styles.803b7e80.js",
       "Settings-3c9e17f3.css",
       "FullscreenLayout-71f16396.css"
     ],
     "t/[slug]/index.svelte": [
-      "index.5d285fcb.js",
-      "FullscreenLayout.79611234.js",
-      "Settings.c1a6d999.js",
-      "faHome.a20aef62.js",
+      "index.585d1f7e.js",
+      "FullscreenLayout.164e5117.js",
+      "Settings.5d1191e4.js",
+      "faHome.6f4183a9.js",
       "inject_styles.803b7e80.js",
       "Settings-3c9e17f3.css",
       "FullscreenLayout-71f16396.css"
     ],
     "t/[slug]/[slug].svelte": [
-      "_slug_.079eb173.js",
-      "FullscreenLayout.79611234.js",
-      "Settings.c1a6d999.js",
-      "faHome.a20aef62.js",
+      "_slug_.2337f86c.js",
+      "FullscreenLayout.164e5117.js",
+      "Settings.5d1191e4.js",
+      "faHome.6f4183a9.js",
       "inject_styles.803b7e80.js",
       "Settings-3c9e17f3.css",
       "FullscreenLayout-71f16396.css"
