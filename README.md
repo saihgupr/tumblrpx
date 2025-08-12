@@ -4,10 +4,10 @@
 
 tumblrpx is a fast & fun way to make slideshows out of tumblr.
 
-<img src="https://i.imgur.com/adWxaFB.jpeg" width="50%" alt="App Screenshot 1">
-<img src="https://i.imgur.com/kLmiBif.jpeg" width="50%" alt="App Screenshot 1">
-<img src="https://i.imgur.com/swpPBfN.png" width="50%" alt="App Screenshot 1">
-<img src="https://i.imgur.com/kShAq0M.png" width="50%" alt="App Screenshot 1">
+<img src="https://i.imgur.com/adWxaFB.jpeg" width="100%" alt="App Screenshot 1">
+<img src="https://i.imgur.com/kLmiBif.jpeg" width="100%" alt="App Screenshot 1">
+<img src="https://i.imgur.com/swpPBfN.png" width="100%" alt="App Screenshot 1">
+<img src="https://i.imgur.com/kShAq0M.png" width="100%" alt="App Screenshot 1">
 
 ## 🚀 Quick Start
 
