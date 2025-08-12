@@ -4,7 +4,7 @@
 
 A fast, modern, and beautiful way to browse Tumblr posts as immersive slideshows. Built with Svelte/Sapper for lightning-fast performance. [tumblrpx.netlify.app](https://tumblrpx.netlify.app/)
 
-![TumblrPX Screenshots](https://i.imgur.com/mUeFUzb.gif)
+![TumblrPX Screenshots](https://i.imgur.com/M17Lefe.gif)
 
 ## ✨ Features
 
