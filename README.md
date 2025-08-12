@@ -34,6 +34,9 @@ A fast, modern, and beautiful way to browse Tumblr posts as immersive slideshows
 - **Autoplay Controls** - Start/stop automatic progression
 - **UI Visibility Toggle** - Show/hide interface elements
 
+<img src="https://i.imgur.com/swpPBfN.png" width="100%" alt="App Screenshot 1">
+<img src="https://i.imgur.com/kShAq0M.png" width="100%" alt="App Screenshot 1">
+
 ## 🚀 Quick Start
 
 ### Prerequisites
