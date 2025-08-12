@@ -1,159 +1,182 @@
 
 
-# tumblrpx - A fast, modern tumblr version of redditpx.com
+# 🎨 TumblrPX - Beautiful Tumblr Slideshow Viewer
 
-tumblrpx is a fast & fun way to make slideshows out of tumblr.
+A fast, modern, and beautiful way to browse Tumblr posts as immersive slideshows. Built with Svelte/Sapper for lightning-fast performance.
 
-<img src="https://i.imgur.com/adWxaFB.jpeg" width="100%" alt="App Screenshot 1">
-<img src="https://i.imgur.com/kLmiBif.jpeg" width="100%" alt="App Screenshot 1">
-<img src="https://i.imgur.com/swpPBfN.png" width="100%" alt="App Screenshot 1">
-<img src="https://i.imgur.com/kShAq0M.png" width="100%" alt="App Screenshot 1">
+![TumblrPX Screenshots](https://i.imgur.com/adWxaFB.jpeg)
+
+## ✨ Features
+
+### 🎯 Core Experience
+- **Fullscreen Slideshow Mode** - Immersive viewing experience with keyboard navigation
+- **Auto-play** - Automatic slideshow progression with customizable intervals
+- **Keyboard Shortcuts** - Complete keyboard control for seamless browsing
+- **UI Hiding** - Clean, distraction-free viewing with hidden UI
+- **Responsive Design** - Works perfectly on desktop, tablet, and mobile
+
+### 🔍 Search & Discovery
+- **Tag Search** - Browse posts by tags using `/search/tagname`
+- **User Profiles** - View any Tumblr user's posts with `/user/username`
+- **Explore Categories** - Discover content in art, photography, design, fashion, and more
+- **Quick Navigation** - Direct URL access to any user or tag
+
+### 💾 Content Management
+- **Favorites System** - Save and organize your favorite posts
+- **Batch Downloads** - Download multiple posts at once
+- **Filter Options** - Filter by images, videos, or both
+- **Portrait/Landscape Toggle** - Focus on specific content orientations
+
+### 🎮 Advanced Controls
+- **Mouse Wheel Navigation** - Scroll to navigate between posts
+- **Fullscreen Toggle** - Press `F` for immersive viewing
+- **Sound Controls** - Mute/unmute video content
+- **Autoplay Controls** - Start/stop automatic progression
+- **UI Visibility Toggle** - Show/hide interface elements
 
 ## 🚀 Quick Start
 
-```bash
-git clone https://github.com/saihgupr/tumblrpx.git
-cd tumblrpx
-./setup.sh
-npm run dev
-# Click the settings gear icon (⚙️) and add your Tumblr API key
-```
-
-## Getting Started
-
-To get a local copy up and running, follow these simple steps.
-
 ### Prerequisites
-
-You'll need [Node.js](https://nodejs.org/) and [npm](https://www.npmjs.com/get-npm) installed on your machine.
+- [Node.js](https://nodejs.org/) (v14 or higher)
+- [npm](https://www.npmjs.com/get-npm)
 
 ### Installation
 
-#### Quick Setup (Recommended)
-1. Clone the repo
-   ```sh
-   git clone https://github.com/saihgupr/redditpx.git
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/saihgupr/tumblrpx.git
+   cd tumblrpx
    ```
-2. Navigate to the project directory
-   ```sh
-   cd redditpx
-   ```
-3. Run the setup script
-   ```sh
+
+2. **Run the setup script**
+   ```bash
    ./setup.sh
    ```
-4. Start the development server
-   ```sh
+
+3. **Start the development server**
+   ```bash
    npm run dev
    ```
-5. Open http://localhost:3000 in your browser
-6. Click the settings gear icon (⚙️) and add your Tumblr API key
-7. Get a Tumblr API Key from [https://www.tumblr.com/oauth/apps](https://www.tumblr.com/oauth/apps)
 
-**Example:**
+4. **Configure your Tumblr API key**
+   - Open http://localhost:3000 in your browser
+   - Click the settings gear icon (⚙️)
+   - Add your Tumblr API key from [Tumblr OAuth Apps](https://www.tumblr.com/oauth/apps)
 
-<img src="https://i.imgur.com/SeH15PO.png" alt="Tumblr API Key Setup" width="50%" />
+### Getting a Tumblr API Key
 
-<img src="https://i.imgur.com/WHqB7AL.png" alt="Tumblr API Key Example" width="50%" />
+1. Visit [Tumblr OAuth Apps](https://www.tumblr.com/oauth/apps)
+2. Create a new application
+3. Copy your "OAuth Consumer Key"
+4. Paste it into the settings in TumblrPX
 
-#### Manual Setup
-If you prefer to set up manually:
-1. Clone the repo and navigate to the project directory
-2. Install dependencies: `npm install`
-3. Run `npm run dev` and configure your API key through the settings UI
+## 🎯 How to Use
 
-### Usage
+### Basic Navigation
+- **Home Page** - Start here to explore users, tags, and favorites
+- **User Browsing** - Enter a username to view their posts
+- **Tag Search** - Use `/search/tagname` to browse posts by tag
 
-To run the app in development mode:
-```sh
-npm run dev
+### Keyboard Shortcuts
+
+| Action | Key(s) |
+|--------|--------|
+| **Navigation** | |
+| Next Post | `→`, `d`, `j`, `Page Down`, `Mouse Wheel Down` |
+| Previous Post | `←`, `a`, `k`, `Page Up`, `Mouse Wheel Up` |
+| Next Album | `↑` |
+| Previous Album | `↓` |
+| **Viewing** | |
+| Toggle Fullscreen | `f` |
+| Toggle UI Visibility | `h` |
+| Toggle Autoplay | `q`, `p` |
+| **Content** | |
+| Toggle Sound | `s` |
+| Toggle Image/Video Filter | `v` |
+| Add/Remove Favorite | `x` |
+| Copy Media Link | `c` |
+| Open Direct Link | `i` |
+
+### URL Structure
+
+- **User Posts**: `/user/username` - Browse any Tumblr user's posts
+- **Tag Search**: `/search/tagname` - Browse posts by tag
+- **Examples**:
+  - `/user/artblog` - View posts from user "artblog"
+  - `/search/photography` - Browse posts tagged with "photography"
+  - `/search/art+digital` - Browse posts with multiple tags
+
+## 🛠️ Development
+
+### Available Scripts
+
+```bash
+# Development
+npm run dev          # Start development server
+npm run build        # Build for production
+npm run start        # Start production server
+npm run export       # Export static site
+
+# Testing
+npm run test         # Run tests
+npm run cy:open      # Open Cypress test runner
 ```
-This will start a development server, usually at `http://localhost:3000`.
 
-To create a production version of the app:
-```sh
-npm run build
+### Project Structure
+
+```
+src/
+├── components/          # Reusable UI components
+├── routes/             # Page routes and layouts
+│   ├── search/         # Tag search functionality
+│   ├── user/           # User profile browsing
+│   └── t/              # Tumblr post viewing
+├── _tumblr_utils.ts    # Tumblr API utilities
+└── _prefs.js           # User preferences and settings
 ```
 
-To run the production version:
-```sh
-npm run start
-```
+## 🎨 Customization
 
-To create a static version of the site that can be hosted on any static web server:
-```sh
-npm run export
-```
-The static files will be located in the `__sapper__/export` directory.
+### Settings Panel
+Access the settings gear icon (⚙️) to customize:
+- **Autoplay Interval** - Control slideshow speed
+- **UI Behavior** - Hide/show interface elements
+- **Content Filters** - Image/video preferences
+- **Display Options** - High/low resolution, portrait/landscape
+- **API Configuration** - Tumblr API key management
 
-## New Features
+### Themes and Styling
+The app uses a modern, dark theme optimized for content viewing. All styles are in SASS and can be customized in the component files.
 
-- [x] Up arrow for next post/album
-- [x] Down arrow for previous post/album
-- [x] Hide UI is on by default
-- [x] Autoplay is on by default
-- [x] F for fullscreen
-- [x] Mouse wheel for next/previous post/album
-- [x] Cursor hides when UI is hidden
+## 🌟 What Makes TumblrPX Special
 
+- **Lightning Fast** - Built with Svelte for optimal performance
+- **Keyboard First** - Complete keyboard navigation for power users
+- **Mobile Optimized** - Touch-friendly interface on all devices
+- **Privacy Focused** - No tracking, no ads, just content
+- **Open Source** - Transparent, community-driven development
 
-## Features
+## 🤝 Contributing
 
-redditpx has the following features
+We welcome contributions! Please feel free to submit issues, feature requests, or pull requests.
 
-- [x] better mobile mode
-- [x] scrolling grid view
-- [x] hover preview
-- [x] filtering
-- [x] favorite
-- [x] batch download
-- [x] fast and modern code
-- [x] user profile
-- [x] /r/random and /r/randnsfw
-- [x] filter images, videos or both
-- [x] search subreddits
-- [ ] customizable keyboard shortcuts
+### Development Setup
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
 
-.. in addition to the features it shares with redditp
+## 📄 License
 
-- [x] multireddit
-- [x] autoplay on/off
-- [x] nsfw on/off
-- [x] direct open fullimage
-- [x] keyboard shortcuts
-- [x] open reddit post and comments
-- [x] /new, /top, /hot support
-- [x] /domain, /user, /u support
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Keybindings
+## 🙏 Acknowledgments
 
-| Action                                                             | Binding                                 |
-| ------------------------------------------------------------------ | --------------------------------------- |
-| <kbd>Left</kbd>, <kbd>a</kbd>, <kbd>k</kbd>, <kbd>Page up</kbd>    | Previous                                |
-| <kbd>Right</kbd>, <kbd>d</kbd>, <kbd>j</kbd>, <kbd>Page down</kbd> | Next                                    |
-| <kbd>Up</kbd>                                                      | Album next                              |
-| <kbd>Down</kbd>                                                    | Album previous                          |
-| <kbd>Scroll Down</kbd>                                             | Next                                    |
-| <kbd>Scroll Up</kbd>                                               | Previous                                |
-| <kbd>m</kbd>                                                       | Add/Remove from multi-reddit            |
-| <kbd>s</kbd>                                                       | Sound on/off                            |
-| <kbd>q</kbd>, <kbd>p</kbd>                                         | Autoplay on/off                         |
-| <kbd>f</kbd>                                                       | Toggle fullscreen                       |
-| <kbd>/</kbd>                                                       | Filter posts                            |
-| <kbd>x</kbd>                                                       | Toggle favorites                        |
-| <kbd>r</kbd>                                                       | Open post on reddit.com                 |
-| <kbd>o</kbd>                                                       | Open post on old.reddit.com             |
-| <kbd>i</kbd>                                                       | Open direct link to media (image,video) |
-| <kbd>l</kbd>                                                       | Open duplicates                         |
-| <kbd>h</kbd>                                                       | Toggle UI visibility                    |
-| <kbd>g</kbd>                                                       | Toggle layout (grid/fullscreen)         |
-| <kbd>v</kbd>                                                       | Toggle image/video                      |
-| <kbd>c</kbd>                                                       | Copy direct media link to clipboard     |
+- Built with [Svelte](https://svelte.dev/) and [Sapper](https://sapper.svelte.dev/)
+- Inspired by [redditpx](https://github.com/jeffjose/redditpx)
+- Icons by [Font Awesome](https://fontawesome.com/)
 
-## Acknowledgements
+---
 
-This project is a fork of [redditpx](https://github.com/jeffjose/redditpx) by [jeffjose](https://github.com/jeffjose), which is itself a fork of [redditp](https://github.com/ubershmekel/redditp) by [ubershmekel](https://github.com/ubershmekel). Both projects are licensed under the MIT License.
-
-- svelte/sapper for framework
-- twemoji for images
-- favicon.io for favicons
+**Made with ❤️ for the Tumblr community**
