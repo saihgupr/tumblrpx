@@ -1,8 +1,13 @@
 
 
-# tumblrpx v1.2 - A fast, modern tumblr version of redditpx.com
+# tumblrpx - A fast, modern tumblr version of redditpx.com
 
 tumblrpx is a fast & fun way to make slideshows out of tumblr.
+
+<img src="https://i.imgur.com/kShAq0M.png" width="25%" alt="App Screenshot 1">
+<img src="https://i.imgur.com/kLmiBif.jpeg" width="25%" alt="App Screenshot 1">
+<img src="https://i.imgur.com/adWxaFB.jpeg" width="25%" alt="App Screenshot 1">
+<img src="https://i.imgur.com/swpPBfN.png" width="25%" alt="App Screenshot 1">
 
 ## 🚀 Quick Start
 
