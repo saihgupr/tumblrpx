@@ -3,7 +3,6 @@ import polka from 'polka';
 import compression from 'compression';
 import fs from 'fs';
 import path from 'path';
-import 'simple-svelte-autocomplete';
 import 'lodash.shuffle';
 import Stream from 'stream';
 import http from 'http';
@@ -34,6 +33,11 @@ function subscribe(store, ...callbacks) {
 function null_to_empty(value) {
     return value == null ? '' : value;
 }
+function custom_event(type, detail, { bubbles = false, cancelable = false } = {}) {
+    const e = document.createEvent('CustomEvent');
+    e.initCustomEvent(type, bubbles, cancelable, detail);
+    return e;
+}
 
 let current_component;
 function set_current_component(component) {
@@ -44,24 +48,82 @@ function get_current_component() {
         throw new Error('Function called outside component initialization');
     return current_component;
 }
+/**
+ * The `onMount` function schedules a callback to run as soon as the component has been mounted to the DOM.
+ * It must be called during the component's initialisation (but doesn't need to live *inside* the component;
+ * it can be called from an external module).
+ *
+ * `onMount` does not run inside a [server-side component](/docs#run-time-server-side-component-api).
+ *
+ * https://svelte.dev/docs#run-time-svelte-onmount
+ */
 function onMount(fn) {
     get_current_component().$$.on_mount.push(fn);
 }
+/**
+ * Schedules a callback to run immediately after the component has been updated.
+ *
+ * The first time the callback runs will be after the initial `onMount`
+ */
 function afterUpdate(fn) {
     get_current_component().$$.after_update.push(fn);
 }
+/**
+ * Creates an event dispatcher that can be used to dispatch [component events](/docs#template-syntax-component-directives-on-eventname).
+ * Event dispatchers are functions that can take two arguments: `name` and `detail`.
+ *
+ * Component events created with `createEventDispatcher` create a
+ * [CustomEvent](https://developer.mozilla.org/en-US/docs/Web/API/CustomEvent).
+ * These events do not [bubble](https://developer.mozilla.org/en-US/docs/Learn/JavaScript/Building_blocks/Events#Event_bubbling_and_capture).
+ * The `detail` argument corresponds to the [CustomEvent.detail](https://developer.mozilla.org/en-US/docs/Web/API/CustomEvent/detail)
+ * property and can contain any type of data.
+ *
+ * https://svelte.dev/docs#run-time-svelte-createeventdispatcher
+ */
+function createEventDispatcher() {
+    const component = get_current_component();
+    return (type, detail, { cancelable = false } = {}) => {
+        const callbacks = component.$$.callbacks[type];
+        if (callbacks) {
+            // TODO are there situations where events could be dispatched
+            // in a server (non-DOM) environment?
+            const event = custom_event(type, detail, { cancelable });
+            callbacks.slice().forEach(fn => {
+                fn.call(component, event);
+            });
+            return !event.defaultPrevented;
+        }
+        return true;
+    };
+}
+/**
+ * Associates an arbitrary `context` object with the current component and the specified `key`
+ * and returns that object. The context is then available to children of the component
+ * (including slotted content) with `getContext`.
+ *
+ * Like lifecycle functions, this must be called during component initialisation.
+ *
+ * https://svelte.dev/docs#run-time-svelte-setcontext
+ */
 function setContext(key, context) {
     get_current_component().$$.context.set(key, context);
+    return context;
 }
+/**
+ * Retrieves the context that belongs to the closest parent component with the specified `key`.
+ * Must be called during component initialisation.
+ *
+ * https://svelte.dev/docs#run-time-svelte-getcontext
+ */
 function getContext(key) {
     return get_current_component().$$.context.get(key);
 }
 
 const dirty_components = [];
 const binding_callbacks = [];
-const render_callbacks = [];
+let render_callbacks = [];
 const flush_callbacks = [];
-const resolved_promise = Promise.resolve();
+const resolved_promise = /* @__PURE__ */ Promise.resolve();
 let update_scheduled = false;
 function schedule_update() {
     if (!update_scheduled) {
@@ -97,15 +159,29 @@ function add_render_callback(fn) {
 const seen_callbacks = new Set();
 let flushidx = 0; // Do *not* move this inside the flush() function
 function flush() {
+    // Do not reenter flush while dirty components are updated, as this can
+    // result in an infinite loop. Instead, let the inner flush handle it.
+    // Reentrancy is ok afterwards for bindings etc.
+    if (flushidx !== 0) {
+        return;
+    }
     const saved_component = current_component;
     do {
         // first, call beforeUpdate functions
         // and update components
-        while (flushidx < dirty_components.length) {
-            const component = dirty_components[flushidx];
-            flushidx++;
-            set_current_component(component);
-            update(component.$$);
+        try {
+            while (flushidx < dirty_components.length) {
+                const component = dirty_components[flushidx];
+                flushidx++;
+                set_current_component(component);
+                update(component.$$);
+            }
+        }
+        catch (e) {
+            // reset dirty state to not end up in a deadlocked state and then rethrow
+            dirty_components.length = 0;
+            flushidx = 0;
+            throw e;
         }
         set_current_component(null);
         dirty_components.length = 0;
@@ -142,43 +218,25 @@ function update($$) {
         $$.after_update.forEach(add_render_callback);
     }
 }
-
-// source: https://html.spec.whatwg.org/multipage/indices.html
-const boolean_attributes = new Set([
-    'allowfullscreen',
-    'allowpaymentrequest',
-    'async',
-    'autofocus',
-    'autoplay',
-    'checked',
-    'controls',
-    'default',
-    'defer',
-    'disabled',
-    'formnovalidate',
-    'hidden',
-    'ismap',
-    'loop',
-    'multiple',
-    'muted',
-    'nomodule',
-    'novalidate',
-    'open',
-    'playsinline',
-    'readonly',
-    'required',
-    'reversed',
-    'selected'
-]);
-const escaped$1 = {
-    '"': '&quot;',
-    "'": '&#39;',
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;'
-};
-function escape(html) {
-    return String(html).replace(/["'&<>]/g, match => escaped$1[match]);
+const ATTR_REGEX = /[&"]/g;
+const CONTENT_REGEX = /[&<]/g;
+/**
+ * Note: this method is performance sensitive and has been optimized
+ * https://github.com/sveltejs/svelte/pull/5701
+ */
+function escape(value, is_attr = false) {
+    const str = String(value);
+    const pattern = is_attr ? ATTR_REGEX : CONTENT_REGEX;
+    pattern.lastIndex = 0;
+    let escaped = '';
+    let last = 0;
+    while (pattern.test(str)) {
+        const i = pattern.lastIndex - 1;
+        const ch = str[i];
+        escaped += str.substring(last, i) + (ch === '&' ? '&amp;' : (ch === '"' ? '&quot;' : '&lt;'));
+        last = i + 1;
+    }
+    return escaped + str.substring(last);
 }
 function each(items, fn) {
     let str = '';
@@ -194,7 +252,7 @@ function validate_component(component, name) {
     if (!component || !component.$$render) {
         if (name === 'svelte:component')
             name += ' this={...}';
-        throw new Error(`<${name}> is not a valid SSR component. You may need to review your build config to ensure that dependencies are compiled, rather than imported as pre-compiled modules`);
+        throw new Error(`<${name}> is not a valid SSR component. You may need to review your build config to ensure that dependencies are compiled, rather than imported as pre-compiled modules. Otherwise you may need to fix a <${name}>.`);
     }
     return component;
 }
@@ -237,14 +295,18 @@ function create_ssr_component(fn) {
 function add_attribute(name, value, boolean) {
     if (value == null || (boolean && !value))
         return '';
-    return ` ${name}${value === true && boolean_attributes.has(name) ? '' : `=${typeof value === 'string' ? JSON.stringify(escape(value)) : `"${value}"`}`}`;
+    const assignment = (boolean && value === true) ? '' : `="${escape(value, true)}"`;
+    return ` ${name}${assignment}`;
 }
 
-/* node_modules/fa-svelte/src/Icon.svelte generated by Svelte v3.46.2 */
+// TODO: Replace with your actual Tumblr API key
+const API_KEY = 'OAuth Consumer Key Goes Here';
+
+/* node_modules/fa-svelte/src/Icon.svelte generated by Svelte v3.59.2 */
 
 const css$5 = {
 	code: ".fa-svelte.svelte-1d15yci{width:1em;height:1em;overflow:visible;display:inline-block}",
-	map: "{\"version\":3,\"file\":\"Icon.svelte\",\"sources\":[\"Icon.svelte\"],\"sourcesContent\":[\"<svg\\r\\n  aria-hidden=\\\"true\\\"\\r\\n  class=\\\"{classes}\\\"\\r\\n  role=\\\"img\\\"\\r\\n  xmlns=\\\"http://www.w3.org/2000/svg\\\"\\r\\n  viewBox=\\\"{viewBox}\\\"\\r\\n>\\r\\n  <path fill=\\\"currentColor\\\" d=\\\"{path}\\\" />\\r\\n</svg>\\r\\n<script>\\r\\n  export let icon;\\r\\n\\r\\n  let path = [];\\r\\n  let classes = \\\"\\\";\\r\\n  let viewBox = \\\"\\\";\\r\\n\\r\\n  $: viewBox = \\\"0 0 \\\" + icon.icon[0] + \\\" \\\" + icon.icon[1];\\r\\n\\r\\n  $: classes = \\\"fa-svelte \\\" + ($$props.class ? $$props.class : \\\"\\\");\\r\\n\\r\\n  $: path = icon.icon[4];\\r\\n</script>\\r\\n\\r\\n<style>\\r\\n  .fa-svelte {\\r\\n    width: 1em;\\r\\n    height: 1em;\\r\\n    overflow: visible;\\r\\n    display: inline-block;\\r\\n  }\\r\\n</style>\"],\"names\":[],\"mappings\":\"AAwBE,UAAU,eAAC,CAAC,AACV,KAAK,CAAE,GAAG,CACV,MAAM,CAAE,GAAG,CACX,QAAQ,CAAE,OAAO,CACjB,OAAO,CAAE,YAAY,AACvB,CAAC\"}"
+	map: "{\"version\":3,\"file\":\"Icon.svelte\",\"sources\":[\"Icon.svelte\"],\"sourcesContent\":[\"<svg\\r\\n  aria-hidden=\\\"true\\\"\\r\\n  class=\\\"{classes}\\\"\\r\\n  role=\\\"img\\\"\\r\\n  xmlns=\\\"http://www.w3.org/2000/svg\\\"\\r\\n  viewBox=\\\"{viewBox}\\\"\\r\\n>\\r\\n  <path fill=\\\"currentColor\\\" d=\\\"{path}\\\" />\\r\\n</svg>\\r\\n<script>\\r\\n  export let icon;\\r\\n\\r\\n  let path = [];\\r\\n  let classes = \\\"\\\";\\r\\n  let viewBox = \\\"\\\";\\r\\n\\r\\n  $: viewBox = \\\"0 0 \\\" + icon.icon[0] + \\\" \\\" + icon.icon[1];\\r\\n\\r\\n  $: classes = \\\"fa-svelte \\\" + ($$props.class ? $$props.class : \\\"\\\");\\r\\n\\r\\n  $: path = icon.icon[4];\\r\\n</script>\\r\\n\\r\\n<style>\\r\\n  .fa-svelte {\\r\\n    width: 1em;\\r\\n    height: 1em;\\r\\n    overflow: visible;\\r\\n    display: inline-block;\\r\\n  }\\r\\n</style>\"],\"names\":[],\"mappings\":\"AAwBE,yBAAW,CACT,KAAK,CAAE,GAAG,CACV,MAAM,CAAE,GAAG,CACX,QAAQ,CAAE,OAAO,CACjB,OAAO,CAAE,YACX\"}"
 };
 
 const Icon = create_ssr_component(($$result, $$props, $$bindings, slots) => {
@@ -257,7 +319,7 @@ const Icon = create_ssr_component(($$result, $$props, $$bindings, slots) => {
 	viewBox = "0 0 " + icon.icon[0] + " " + icon.icon[1];
 	classes = "fa-svelte " + ($$props.class ? $$props.class : "");
 	path = icon.icon[4];
-	return `<svg aria-hidden="${"true"}" class="${escape(null_to_empty(classes)) + " svelte-1d15yci"}" role="${"img"}" xmlns="${"http://www.w3.org/2000/svg"}"${add_attribute("viewBox", viewBox, 0)}><path fill="${"currentColor"}"${add_attribute("d", path, 0)}></path></svg>`;
+	return `<svg aria-hidden="true" class="${escape(null_to_empty(classes), true) + " svelte-1d15yci"}" role="img" xmlns="http://www.w3.org/2000/svg"${add_attribute("viewBox", viewBox, 0)}><path fill="currentColor"${add_attribute("d", path, 0)}></path></svg>`;
 });
 
 var commonjsGlobal = typeof globalThis !== 'undefined' ? globalThis : typeof window !== 'undefined' ? window : typeof global !== 'undefined' ? global : typeof self !== 'undefined' ? self : {};
@@ -276,15 +338,15 @@ function commonjsRequire$1 () {
 	throw new Error('Dynamic requires are not currently supported by @rollup/plugin-commonjs');
 }
 
-var faVolumeUp = createCommonjsModule$1(function (module, exports) {
+var faVolumeHigh = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
-var iconName = 'volume-up';
-var width = 576;
+var iconName = 'volume-high';
+var width = 640;
 var height = 512;
-var ligatures = [];
+var aliases = [128266,"volume-up"];
 var unicode = 'f028';
-var svgPathData = 'M215.03 71.05L126.06 160H24c-13.26 0-24 10.74-24 24v144c0 13.25 10.74 24 24 24h102.06l88.97 88.95c15.03 15.03 40.97 4.47 40.97-16.97V88.02c0-21.46-25.96-31.98-40.97-16.97zm233.32-51.08c-11.17-7.33-26.18-4.24-33.51 6.95-7.34 11.17-4.22 26.18 6.95 33.51 66.27 43.49 105.82 116.6 105.82 195.58 0 78.98-39.55 152.09-105.82 195.58-11.17 7.32-14.29 22.34-6.95 33.5 7.04 10.71 21.93 14.56 33.51 6.95C528.27 439.58 576 351.33 576 256S528.27 72.43 448.35 19.97zM480 256c0-63.53-32.06-121.94-85.77-156.24-11.19-7.14-26.03-3.82-33.12 7.46s-3.78 26.21 7.41 33.36C408.27 165.97 432 209.11 432 256s-23.73 90.03-63.48 115.42c-11.19 7.14-14.5 22.07-7.41 33.36 6.51 10.36 21.12 15.14 33.12 7.46C447.94 377.94 480 319.54 480 256zm-141.77-76.87c-11.58-6.33-26.19-2.16-32.61 9.45-6.39 11.61-2.16 26.2 9.45 32.61C327.98 228.28 336 241.63 336 256c0 14.38-8.02 27.72-20.92 34.81-11.61 6.41-15.84 21-9.45 32.61 6.43 11.66 21.05 15.8 32.61 9.45 28.23-15.55 45.77-45 45.77-76.88s-17.54-61.32-45.78-76.86z';
+var svgPathData = 'M533.6 32.5c-10.3-8.4-25.4-6.8-33.8 3.5s-6.8 25.4 3.5 33.8C557.5 113.8 592 180.8 592 256s-34.5 142.2-88.7 186.3c-10.3 8.4-11.8 23.5-3.5 33.8s23.5 11.8 33.8 3.5C598.5 426.7 640 346.2 640 256S598.5 85.2 533.6 32.5zM473.1 107c-10.3-8.4-25.4-6.8-33.8 3.5s-6.8 25.4 3.5 33.8C475.3 170.7 496 210.9 496 256s-20.7 85.3-53.2 111.8c-10.3 8.4-11.8 23.5-3.5 33.8s23.5 11.8 33.8 3.5c43.2-35.2 70.9-88.9 70.9-149s-27.7-113.8-70.9-149zm-60.5 74.5c-10.3-8.4-25.4-6.8-33.8 3.5s-6.8 25.4 3.5 33.8C393.1 227.6 400 241 400 256s-6.9 28.4-17.7 37.3c-10.3 8.4-11.8 23.5-3.5 33.8s23.5 11.8 33.8 3.5C434.1 312.9 448 286.1 448 256s-13.9-56.9-35.4-74.5zM80 352l48 0 134.1 119.2c6.4 5.7 14.6 8.8 23.1 8.8 19.2 0 34.8-15.6 34.8-34.8l0-378.4c0-19.2-15.6-34.8-34.8-34.8-8.5 0-16.7 3.1-23.1 8.8L128 160 80 160c-26.5 0-48 21.5-48 48l0 96c0 26.5 21.5 48 48 48z';
 
 exports.definition = {
   prefix: prefix,
@@ -292,32 +354,60 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
 
-exports.faVolumeUp = exports.definition;
+exports.faVolumeHigh = exports.definition;
 exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
+});
+
+var source$a = faVolumeHigh;
+
+var faVolumeUp = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+
+exports.definition = {
+  prefix: source$a.prefix,
+  iconName: source$a.iconName,
+  icon: [
+    source$a.width,
+    source$a.height,
+    source$a.aliases,
+    source$a.unicode,
+    source$a.svgPathData
+  ]};
+
+exports.faVolumeUp = exports.definition;
+exports.prefix = source$a.prefix;
+exports.iconName = source$a.iconName;
+exports.width = source$a.width;
+exports.height = source$a.height;
+exports.ligatures = source$a.aliases;
+exports.unicode = source$a.unicode;
+exports.svgPathData = source$a.svgPathData;
+exports.aliases = source$a.aliases;
 });
 
 var faVolumeUp$1 = faVolumeUp;
 
-var faVolumeMute = createCommonjsModule$1(function (module, exports) {
+var faVolumeXmark = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
-var iconName = 'volume-mute';
-var width = 512;
+var iconName = 'volume-xmark';
+var width = 576;
 var height = 512;
-var ligatures = [];
+var aliases = ["volume-mute","volume-times"];
 var unicode = 'f6a9';
-var svgPathData = 'M215.03 71.05L126.06 160H24c-13.26 0-24 10.74-24 24v144c0 13.25 10.74 24 24 24h102.06l88.97 88.95c15.03 15.03 40.97 4.47 40.97-16.97V88.02c0-21.46-25.96-31.98-40.97-16.97zM461.64 256l45.64-45.64c6.3-6.3 6.3-16.52 0-22.82l-22.82-22.82c-6.3-6.3-16.52-6.3-22.82 0L416 210.36l-45.64-45.64c-6.3-6.3-16.52-6.3-22.82 0l-22.82 22.82c-6.3 6.3-6.3 16.52 0 22.82L370.36 256l-45.63 45.63c-6.3 6.3-6.3 16.52 0 22.82l22.82 22.82c6.3 6.3 16.52 6.3 22.82 0L416 301.64l45.64 45.64c6.3 6.3 16.52 6.3 22.82 0l22.82-22.82c6.3-6.3 6.3-16.52 0-22.82L461.64 256z';
+var svgPathData = 'M48 352l48 0 134.1 119.2c6.4 5.7 14.6 8.8 23.1 8.8 19.2 0 34.8-15.6 34.8-34.8l0-378.4c0-19.2-15.6-34.8-34.8-34.8-8.5 0-16.7 3.1-23.1 8.8L96 160 48 160c-26.5 0-48 21.5-48 48l0 96c0 26.5 21.5 48 48 48zM367 175c-9.4 9.4-9.4 24.6 0 33.9l47 47-47 47c-9.4 9.4-9.4 24.6 0 33.9s24.6 9.4 33.9 0l47-47 47 47c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-47-47 47-47c9.4-9.4 9.4-24.6 0-33.9s-24.6-9.4-33.9 0l-47 47-47-47c-9.4-9.4-24.6-9.4-33.9 0z';
 
 exports.definition = {
   prefix: prefix,
@@ -325,19 +415,47 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
 
-exports.faVolumeMute = exports.definition;
+exports.faVolumeXmark = exports.definition;
 exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
+});
+
+var source$9 = faVolumeXmark;
+
+var faVolumeMute = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+
+exports.definition = {
+  prefix: source$9.prefix,
+  iconName: source$9.iconName,
+  icon: [
+    source$9.width,
+    source$9.height,
+    source$9.aliases,
+    source$9.unicode,
+    source$9.svgPathData
+  ]};
+
+exports.faVolumeMute = exports.definition;
+exports.prefix = source$9.prefix;
+exports.iconName = source$9.iconName;
+exports.width = source$9.width;
+exports.height = source$9.height;
+exports.ligatures = source$9.aliases;
+exports.unicode = source$9.unicode;
+exports.svgPathData = source$9.svgPathData;
+exports.aliases = source$9.aliases;
 });
 
 var faVolumeMute$1 = faVolumeMute;
@@ -348,9 +466,9 @@ var prefix = 'fas';
 var iconName = 'play';
 var width = 448;
 var height = 512;
-var ligatures = [];
+var aliases = [9654];
 var unicode = 'f04b';
-var svgPathData = 'M424.4 214.7L72.4 6.6C43.8-10.3 0 6.1 0 47.9V464c0 37.5 40.7 60.1 72.4 41.3l352-208c31.4-18.5 31.5-64.1 0-82.6z';
+var svgPathData = 'M91.2 36.9c-12.4-6.8-27.4-6.5-39.6 .7S32 57.9 32 72l0 368c0 14.1 7.5 27.2 19.6 34.4s27.2 7.5 39.6 .7l336-184c12.8-7 20.8-20.5 20.8-35.1s-8-28.1-20.8-35.1l-336-184z';
 
 exports.definition = {
   prefix: prefix,
@@ -358,7 +476,7 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
@@ -368,9 +486,10 @@ exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
 });
 
 var faPlay$1 = faPlay;
@@ -379,11 +498,11 @@ var faPause = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
 var iconName = 'pause';
-var width = 448;
+var width = 384;
 var height = 512;
-var ligatures = [];
+var aliases = [9208];
 var unicode = 'f04c';
-var svgPathData = 'M144 479H48c-26.5 0-48-21.5-48-48V79c0-26.5 21.5-48 48-48h96c26.5 0 48 21.5 48 48v352c0 26.5-21.5 48-48 48zm304-48V79c0-26.5-21.5-48-48-48h-96c-26.5 0-48 21.5-48 48v352c0 26.5 21.5 48 48 48h96c26.5 0 48-21.5 48-48z';
+var svgPathData = 'M48 32C21.5 32 0 53.5 0 80L0 432c0 26.5 21.5 48 48 48l64 0c26.5 0 48-21.5 48-48l0-352c0-26.5-21.5-48-48-48L48 32zm224 0c-26.5 0-48 21.5-48 48l0 352c0 26.5 21.5 48 48 48l64 0c26.5 0 48-21.5 48-48l0-352c0-26.5-21.5-48-48-48l-64 0z';
 
 exports.definition = {
   prefix: prefix,
@@ -391,7 +510,7 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
@@ -401,22 +520,23 @@ exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
 });
 
 var faPause$1 = faPause;
 
-var faCog = createCommonjsModule$1(function (module, exports) {
+var faGear = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
-var iconName = 'cog';
+var iconName = 'gear';
 var width = 512;
 var height = 512;
-var ligatures = [];
+var aliases = [9881,"cog"];
 var unicode = 'f013';
-var svgPathData = 'M487.4 315.7l-42.6-24.6c4.3-23.2 4.3-47 0-70.2l42.6-24.6c4.9-2.8 7.1-8.6 5.5-14-11.1-35.6-30-67.8-54.7-94.6-3.8-4.1-10-5.1-14.8-2.3L380.8 110c-17.9-15.4-38.5-27.3-60.8-35.1V25.8c0-5.6-3.9-10.5-9.4-11.7-36.7-8.2-74.3-7.8-109.2 0-5.5 1.2-9.4 6.1-9.4 11.7V75c-22.2 7.9-42.8 19.8-60.8 35.1L88.7 85.5c-4.9-2.8-11-1.9-14.8 2.3-24.7 26.7-43.6 58.9-54.7 94.6-1.7 5.4.6 11.2 5.5 14L67.3 221c-4.3 23.2-4.3 47 0 70.2l-42.6 24.6c-4.9 2.8-7.1 8.6-5.5 14 11.1 35.6 30 67.8 54.7 94.6 3.8 4.1 10 5.1 14.8 2.3l42.6-24.6c17.9 15.4 38.5 27.3 60.8 35.1v49.2c0 5.6 3.9 10.5 9.4 11.7 36.7 8.2 74.3 7.8 109.2 0 5.5-1.2 9.4-6.1 9.4-11.7v-49.2c22.2-7.9 42.8-19.8 60.8-35.1l42.6 24.6c4.9 2.8 11 1.9 14.8-2.3 24.7-26.7 43.6-58.9 54.7-94.6 1.5-5.5-.7-11.3-5.6-14.1zM256 336c-44.1 0-80-35.9-80-80s35.9-80 80-80 80 35.9 80 80-35.9 80-80 80z';
+var svgPathData = 'M195.1 9.5C198.1-5.3 211.2-16 226.4-16l59.8 0c15.2 0 28.3 10.7 31.3 25.5L332 79.5c14.1 6 27.3 13.7 39.3 22.8l67.8-22.5c14.4-4.8 30.2 1.2 37.8 14.4l29.9 51.8c7.6 13.2 4.9 29.8-6.5 39.9L447 233.3c.9 7.4 1.3 15 1.3 22.7s-.5 15.3-1.3 22.7l53.4 47.5c11.4 10.1 14 26.8 6.5 39.9l-29.9 51.8c-7.6 13.1-23.4 19.2-37.8 14.4l-67.8-22.5c-12.1 9.1-25.3 16.7-39.3 22.8l-14.4 69.9c-3.1 14.9-16.2 25.5-31.3 25.5l-59.8 0c-15.2 0-28.3-10.7-31.3-25.5l-14.4-69.9c-14.1-6-27.2-13.7-39.3-22.8L73.5 432.3c-14.4 4.8-30.2-1.2-37.8-14.4L5.8 366.1c-7.6-13.2-4.9-29.8 6.5-39.9l53.4-47.5c-.9-7.4-1.3-15-1.3-22.7s.5-15.3 1.3-22.7L12.3 185.8c-11.4-10.1-14-26.8-6.5-39.9L35.7 94.1c7.6-13.2 23.4-19.2 37.8-14.4l67.8 22.5c12.1-9.1 25.3-16.7 39.3-22.8L195.1 9.5zM256.3 336a80 80 0 1 0 -.6-160 80 80 0 1 0 .6 160z';
 
 exports.definition = {
   prefix: prefix,
@@ -424,32 +544,60 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
 
-exports.faCog = exports.definition;
+exports.faGear = exports.definition;
 exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
+});
+
+var source$8 = faGear;
+
+var faCog = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+
+exports.definition = {
+  prefix: source$8.prefix,
+  iconName: source$8.iconName,
+  icon: [
+    source$8.width,
+    source$8.height,
+    source$8.aliases,
+    source$8.unicode,
+    source$8.svgPathData
+  ]};
+
+exports.faCog = exports.definition;
+exports.prefix = source$8.prefix;
+exports.iconName = source$8.iconName;
+exports.width = source$8.width;
+exports.height = source$8.height;
+exports.ligatures = source$8.aliases;
+exports.unicode = source$8.unicode;
+exports.svgPathData = source$8.svgPathData;
+exports.aliases = source$8.aliases;
 });
 
 var faCog$1 = faCog;
 
-var faHome = createCommonjsModule$1(function (module, exports) {
+var faHouse = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
-var iconName = 'home';
-var width = 576;
+var iconName = 'house';
+var width = 512;
 var height = 512;
-var ligatures = [];
+var aliases = [127968,63498,63500,"home","home-alt","home-lg-alt"];
 var unicode = 'f015';
-var svgPathData = 'M280.37 148.26L96 300.11V464a16 16 0 0 0 16 16l112.06-.29a16 16 0 0 0 15.92-16V368a16 16 0 0 1 16-16h64a16 16 0 0 1 16 16v95.64a16 16 0 0 0 16 16.05L464 480a16 16 0 0 0 16-16V300L295.67 148.26a12.19 12.19 0 0 0-15.3 0zM571.6 251.47L488 182.56V44.05a12 12 0 0 0-12-12h-56a12 12 0 0 0-12 12v72.61L318.47 43a48 48 0 0 0-61 0L4.34 251.47a12 12 0 0 0-1.6 16.9l25.5 31A12 12 0 0 0 45.15 301l235.22-193.74a12.19 12.19 0 0 1 15.3 0L530.9 301a12 12 0 0 0 16.9-1.6l25.5-31a12 12 0 0 0-1.7-16.93z';
+var svgPathData = 'M277.8 8.6c-12.3-11.4-31.3-11.4-43.5 0l-224 208c-9.6 9-12.8 22.9-8 35.1S18.8 272 32 272l16 0 0 176c0 35.3 28.7 64 64 64l288 0c35.3 0 64-28.7 64-64l0-176 16 0c13.2 0 25-8.1 29.8-20.3s1.6-26.2-8-35.1l-224-208zM240 320l32 0c26.5 0 48 21.5 48 48l0 96-128 0 0-96c0-26.5 21.5-48 48-48z';
 
 exports.definition = {
   prefix: prefix,
@@ -457,32 +605,60 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
 
-exports.faHome = exports.definition;
+exports.faHouse = exports.definition;
 exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
+});
+
+var source$7 = faHouse;
+
+var faHome = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+
+exports.definition = {
+  prefix: source$7.prefix,
+  iconName: source$7.iconName,
+  icon: [
+    source$7.width,
+    source$7.height,
+    source$7.aliases,
+    source$7.unicode,
+    source$7.svgPathData
+  ]};
+
+exports.faHome = exports.definition;
+exports.prefix = source$7.prefix;
+exports.iconName = source$7.iconName;
+exports.width = source$7.width;
+exports.height = source$7.height;
+exports.ligatures = source$7.aliases;
+exports.unicode = source$7.unicode;
+exports.svgPathData = source$7.svgPathData;
+exports.aliases = source$7.aliases;
 });
 
 var faHome$1 = faHome;
 
-var faDonate = createCommonjsModule$1(function (module, exports) {
+var faCloudArrowDown = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
-var iconName = 'donate';
-var width = 512;
+var iconName = 'cloud-arrow-down';
+var width = 576;
 var height = 512;
-var ligatures = [];
-var unicode = 'f4b9';
-var svgPathData = 'M256 416c114.9 0 208-93.1 208-208S370.9 0 256 0 48 93.1 48 208s93.1 208 208 208zM233.8 97.4V80.6c0-9.2 7.4-16.6 16.6-16.6h11.1c9.2 0 16.6 7.4 16.6 16.6v17c15.5.8 30.5 6.1 43 15.4 5.6 4.1 6.2 12.3 1.2 17.1L306 145.6c-3.8 3.7-9.5 3.8-14 1-5.4-3.4-11.4-5.1-17.8-5.1h-38.9c-9 0-16.3 8.2-16.3 18.3 0 8.2 5 15.5 12.1 17.6l62.3 18.7c25.7 7.7 43.7 32.4 43.7 60.1 0 34-26.4 61.5-59.1 62.4v16.8c0 9.2-7.4 16.6-16.6 16.6h-11.1c-9.2 0-16.6-7.4-16.6-16.6v-17c-15.5-.8-30.5-6.1-43-15.4-5.6-4.1-6.2-12.3-1.2-17.1l16.3-15.5c3.8-3.7 9.5-3.8 14-1 5.4 3.4 11.4 5.1 17.8 5.1h38.9c9 0 16.3-8.2 16.3-18.3 0-8.2-5-15.5-12.1-17.6l-62.3-18.7c-25.7-7.7-43.7-32.4-43.7-60.1.1-34 26.4-61.5 59.1-62.4zM480 352h-32.5c-19.6 26-44.6 47.7-73 64h63.8c5.3 0 9.6 3.6 9.6 8v16c0 4.4-4.3 8-9.6 8H73.6c-5.3 0-9.6-3.6-9.6-8v-16c0-4.4 4.3-8 9.6-8h63.8c-28.4-16.3-53.3-38-73-64H32c-17.7 0-32 14.3-32 32v96c0 17.7 14.3 32 32 32h448c17.7 0 32-14.3 32-32v-96c0-17.7-14.3-32-32-32z';
+var aliases = [62337,"cloud-download","cloud-download-alt"];
+var unicode = 'f0ed';
+var svgPathData = 'M144 480c-79.5 0-144-64.5-144-144 0-63.4 41-117.2 97.9-136.5-1.3-7.7-1.9-15.5-1.9-23.5 0-79.5 64.5-144 144-144 55.4 0 103.5 31.3 127.6 77.1 14.2-8.3 30.8-13.1 48.4-13.1 53 0 96 43 96 96 0 15.7-3.8 30.6-10.5 43.7 44 20.3 74.5 64.7 74.5 116.3 0 70.7-57.3 128-128 128l-304 0zM377 313c9.4-9.4 9.4-24.6 0-33.9s-24.6-9.4-33.9 0l-31 31 0-102.1c0-13.3-10.7-24-24-24s-24 10.7-24 24l0 102.1-31-31c-9.4-9.4-24.6-9.4-33.9 0s-9.4 24.6 0 33.9l72 72c9.4 9.4 24.6 9.4 33.9 0l72-72z';
 
 exports.definition = {
   prefix: prefix,
@@ -490,52 +666,47 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
 
-exports.faDonate = exports.definition;
+exports.faCloudArrowDown = exports.definition;
 exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
 });
 
-var faDonate$1 = faDonate;
+var source$6 = faCloudArrowDown;
 
 var faCloudDownloadAlt = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
-var prefix = 'fas';
-var iconName = 'cloud-download-alt';
-var width = 640;
-var height = 512;
-var ligatures = [];
-var unicode = 'f381';
-var svgPathData = 'M537.6 226.6c4.1-10.7 6.4-22.4 6.4-34.6 0-53-43-96-96-96-19.7 0-38.1 6-53.3 16.2C367 64.2 315.3 32 256 32c-88.4 0-160 71.6-160 160 0 2.7.1 5.4.2 8.1C40.2 219.8 0 273.2 0 336c0 79.5 64.5 144 144 144h368c70.7 0 128-57.3 128-128 0-61.9-44-113.6-102.4-125.4zm-132.9 88.7L299.3 420.7c-6.2 6.2-16.4 6.2-22.6 0L171.3 315.3c-10.1-10.1-2.9-27.3 11.3-27.3H248V176c0-8.8 7.2-16 16-16h48c8.8 0 16 7.2 16 16v112h65.4c14.2 0 21.4 17.2 11.3 27.3z';
 
 exports.definition = {
-  prefix: prefix,
-  iconName: iconName,
+  prefix: source$6.prefix,
+  iconName: source$6.iconName,
   icon: [
-    width,
-    height,
-    ligatures,
-    unicode,
-    svgPathData
+    source$6.width,
+    source$6.height,
+    source$6.aliases,
+    source$6.unicode,
+    source$6.svgPathData
   ]};
 
 exports.faCloudDownloadAlt = exports.definition;
-exports.prefix = prefix;
-exports.iconName = iconName;
-exports.width = width;
-exports.height = height;
-exports.ligatures = ligatures;
-exports.unicode = unicode;
-exports.svgPathData = svgPathData;
+exports.prefix = source$6.prefix;
+exports.iconName = source$6.iconName;
+exports.width = source$6.width;
+exports.height = source$6.height;
+exports.ligatures = source$6.aliases;
+exports.unicode = source$6.unicode;
+exports.svgPathData = source$6.svgPathData;
+exports.aliases = source$6.aliases;
 });
 
 var faCloudDownloadAlt$1 = faCloudDownloadAlt;
@@ -544,11 +715,11 @@ var faDice = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
 var iconName = 'dice';
-var width = 640;
+var width = 512;
 var height = 512;
-var ligatures = [];
+var aliases = [127922];
 var unicode = 'f522';
-var svgPathData = 'M592 192H473.26c12.69 29.59 7.12 65.2-17 89.32L320 417.58V464c0 26.51 21.49 48 48 48h224c26.51 0 48-21.49 48-48V240c0-26.51-21.49-48-48-48zM480 376c-13.25 0-24-10.75-24-24 0-13.26 10.75-24 24-24s24 10.74 24 24c0 13.25-10.75 24-24 24zm-46.37-186.7L258.7 14.37c-19.16-19.16-50.23-19.16-69.39 0L14.37 189.3c-19.16 19.16-19.16 50.23 0 69.39L189.3 433.63c19.16 19.16 50.23 19.16 69.39 0L433.63 258.7c19.16-19.17 19.16-50.24 0-69.4zM96 248c-13.25 0-24-10.75-24-24 0-13.26 10.75-24 24-24s24 10.74 24 24c0 13.25-10.75 24-24 24zm128 128c-13.25 0-24-10.75-24-24 0-13.26 10.75-24 24-24s24 10.74 24 24c0 13.25-10.75 24-24 24zm0-128c-13.25 0-24-10.75-24-24 0-13.26 10.75-24 24-24s24 10.74 24 24c0 13.25-10.75 24-24 24zm0-128c-13.25 0-24-10.75-24-24 0-13.26 10.75-24 24-24s24 10.74 24 24c0 13.25-10.75 24-24 24zm128 128c-13.25 0-24-10.75-24-24 0-13.26 10.75-24 24-24s24 10.74 24 24c0 13.25-10.75 24-24 24z';
+var svgPathData = 'M141.4 2.3C103-8 63.5 14.8 53.3 53.2L2.5 242.7C-7.8 281.1 15 320.6 53.4 330.9l189.5 50.8c38.4 10.3 77.9-12.5 88.2-50.9l50.8-189.5c10.3-38.4-12.5-77.9-50.9-88.2L141.4 2.3zm23 205.7a32 32 0 1 1 55.4-32 32 32 0 1 1 -55.4 32zM79.2 220.3a32 32 0 1 1 32 55.4 32 32 0 1 1 -32-55.4zm185 96.4a32 32 0 1 1 -32-55.4 32 32 0 1 1 32 55.4zm9-208.4a32 32 0 1 1 32 55.4 32 32 0 1 1 -32-55.4zm-121 14.4a32 32 0 1 1 -32-55.4 32 32 0 1 1 32 55.4zM418 192L377.4 343.2c-17.2 64-83 102-147 84.9l-38.3-10.3 0 30.2c0 35.3 28.7 64 64 64l192 0c35.3 0 64-28.7 64-64l0-192c0-35.3-28.7-64-64-64L418 192z';
 
 exports.definition = {
   prefix: prefix,
@@ -556,7 +727,7 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
@@ -566,22 +737,23 @@ exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
 });
 
 var faDice$1 = faDice;
 
-var faPhotoVideo = createCommonjsModule$1(function (module, exports) {
+var faPhotoFilm = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
-var iconName = 'photo-video';
+var iconName = 'photo-film';
 var width = 640;
 var height = 512;
-var ligatures = [];
+var aliases = ["photo-video"];
 var unicode = 'f87c';
-var svgPathData = 'M608 0H160a32 32 0 0 0-32 32v96h160V64h192v320h128a32 32 0 0 0 32-32V32a32 32 0 0 0-32-32zM232 103a9 9 0 0 1-9 9h-30a9 9 0 0 1-9-9V73a9 9 0 0 1 9-9h30a9 9 0 0 1 9 9zm352 208a9 9 0 0 1-9 9h-30a9 9 0 0 1-9-9v-30a9 9 0 0 1 9-9h30a9 9 0 0 1 9 9zm0-104a9 9 0 0 1-9 9h-30a9 9 0 0 1-9-9v-30a9 9 0 0 1 9-9h30a9 9 0 0 1 9 9zm0-104a9 9 0 0 1-9 9h-30a9 9 0 0 1-9-9V73a9 9 0 0 1 9-9h30a9 9 0 0 1 9 9zm-168 57H32a32 32 0 0 0-32 32v288a32 32 0 0 0 32 32h384a32 32 0 0 0 32-32V192a32 32 0 0 0-32-32zM96 224a32 32 0 1 1-32 32 32 32 0 0 1 32-32zm288 224H64v-32l64-64 32 32 128-128 96 96z';
+var svgPathData = 'M192 64c0-35.3 28.7-64 64-64L576 0c35.3 0 64 28.7 64 64l0 224c0 35.3-28.7 64-64 64l-320 0c-35.3 0-64-28.7-64-64l0-224zM320 96a32 32 0 1 0 -64 0 32 32 0 1 0 64 0zm156.5 11.5C472.1 100.4 464.4 96 456 96s-16.1 4.4-20.5 11.5l-54 88.3-17.9-25.6c-4.5-6.4-11.8-10.2-19.7-10.2s-15.2 3.8-19.7 10.2l-56 80c-5.1 7.3-5.8 16.9-1.6 24.8S279.1 288 288 288l256 0c8.7 0 16.7-4.7 20.9-12.3s4.1-16.8-.5-24.3l-88-144zM144 128l0 160c0 61.9 50.1 112 112 112l192 0 0 16c0 35.3-28.7 64-64 64L64 480c-35.3 0-64-28.7-64-64L0 192c0-35.3 28.7-64 64-64l80 0zM52 196l0 24c0 8.8 7.2 16 16 16l24 0c8.8 0 16-7.2 16-16l0-24c0-8.8-7.2-16-16-16l-24 0c-8.8 0-16 7.2-16 16zm16 80c-8.8 0-16 7.2-16 16l0 24c0 8.8 7.2 16 16 16l24 0c8.8 0 16-7.2 16-16l0-24c0-8.8-7.2-16-16-16l-24 0zm0 96c-8.8 0-16 7.2-16 16l0 24c0 8.8 7.2 16 16 16l24 0c8.8 0 16-7.2 16-16l0-24c0-8.8-7.2-16-16-16l-24 0z';
 
 exports.definition = {
   prefix: prefix,
@@ -589,55 +761,50 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
+  ]};
+
+exports.faPhotoFilm = exports.definition;
+exports.prefix = prefix;
+exports.iconName = iconName;
+exports.width = width;
+exports.height = height;
+exports.ligatures = aliases;
+exports.unicode = unicode;
+exports.svgPathData = svgPathData;
+exports.aliases = aliases;
+});
+
+var source$5 = faPhotoFilm;
+
+var faPhotoVideo = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+
+exports.definition = {
+  prefix: source$5.prefix,
+  iconName: source$5.iconName,
+  icon: [
+    source$5.width,
+    source$5.height,
+    source$5.aliases,
+    source$5.unicode,
+    source$5.svgPathData
   ]};
 
 exports.faPhotoVideo = exports.definition;
-exports.prefix = prefix;
-exports.iconName = iconName;
-exports.width = width;
-exports.height = height;
-exports.ligatures = ligatures;
-exports.unicode = unicode;
-exports.svgPathData = svgPathData;
+exports.prefix = source$5.prefix;
+exports.iconName = source$5.iconName;
+exports.width = source$5.width;
+exports.height = source$5.height;
+exports.ligatures = source$5.aliases;
+exports.unicode = source$5.unicode;
+exports.svgPathData = source$5.svgPathData;
+exports.aliases = source$5.aliases;
 });
 
 var faPhotoVideo$1 = faPhotoVideo;
-
-var faImage = createCommonjsModule$1(function (module, exports) {
-Object.defineProperty(exports, '__esModule', { value: true });
-var prefix = 'fas';
-var iconName = 'image';
-var width = 512;
-var height = 512;
-var ligatures = [];
-var unicode = 'f03e';
-var svgPathData = 'M464 448H48c-26.51 0-48-21.49-48-48V112c0-26.51 21.49-48 48-48h416c26.51 0 48 21.49 48 48v288c0 26.51-21.49 48-48 48zM112 120c-30.928 0-56 25.072-56 56s25.072 56 56 56 56-25.072 56-56-25.072-56-56-56zM64 384h384V272l-87.515-87.515c-4.686-4.686-12.284-4.686-16.971 0L208 320l-55.515-55.515c-4.686-4.686-12.284-4.686-16.971 0L64 336v48z';
-
-exports.definition = {
-  prefix: prefix,
-  iconName: iconName,
-  icon: [
-    width,
-    height,
-    ligatures,
-    unicode,
-    svgPathData
-  ]};
-
-exports.faImage = exports.definition;
-exports.prefix = prefix;
-exports.iconName = iconName;
-exports.width = width;
-exports.height = height;
-exports.ligatures = ligatures;
-exports.unicode = unicode;
-exports.svgPathData = svgPathData;
-});
-
-var faImage$1 = faImage;
 
 var faVideo = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
@@ -645,9 +812,9 @@ var prefix = 'fas';
 var iconName = 'video';
 var width = 576;
 var height = 512;
-var ligatures = [];
+var aliases = ["video-camera"];
 var unicode = 'f03d';
-var svgPathData = 'M336.2 64H47.8C21.4 64 0 85.4 0 111.8v288.4C0 426.6 21.4 448 47.8 448h288.4c26.4 0 47.8-21.4 47.8-47.8V111.8c0-26.4-21.4-47.8-47.8-47.8zm189.4 37.7L416 177.3v157.4l109.6 75.5c21.2 14.6 50.4-.3 50.4-25.8V127.5c0-25.4-29.1-40.4-50.4-25.8z';
+var svgPathData = 'M96 64c-35.3 0-64 28.7-64 64l0 256c0 35.3 28.7 64 64 64l256 0c35.3 0 64-28.7 64-64l0-256c0-35.3-28.7-64-64-64L96 64zM464 336l73.5 58.8c4.2 3.4 9.4 5.2 14.8 5.2 13.1 0 23.7-10.6 23.7-23.7l0-240.6c0-13.1-10.6-23.7-23.7-23.7-5.4 0-10.6 1.8-14.8 5.2L464 176 464 336z';
 
 exports.definition = {
   prefix: prefix,
@@ -655,7 +822,7 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
@@ -665,22 +832,23 @@ exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
 });
 
 var faVideo$1 = faVideo;
 
-var faStar$2 = createCommonjsModule$1(function (module, exports) {
+var faImage = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
-var iconName = 'star';
-var width = 576;
+var iconName = 'image';
+var width = 448;
 var height = 512;
-var ligatures = [];
-var unicode = 'f005';
-var svgPathData = 'M259.3 17.8L194 150.2 47.9 171.5c-26.2 3.8-36.7 36.1-17.7 54.6l105.7 103-25 145.5c-4.5 26.3 23.2 46 46.4 33.7L288 439.6l130.7 68.7c23.2 12.2 50.9-7.4 46.4-33.7l-25-145.5 105.7-103c19-18.5 8.5-50.8-17.7-54.6L382 150.2 316.7 17.8c-11.7-23.6-45.6-23.9-57.4 0z';
+var aliases = [];
+var unicode = 'f03e';
+var svgPathData = 'M64 32C28.7 32 0 60.7 0 96L0 416c0 35.3 28.7 64 64 64l320 0c35.3 0 64-28.7 64-64l0-320c0-35.3-28.7-64-64-64L64 32zm64 80a48 48 0 1 1 0 96 48 48 0 1 1 0-96zM272 224c8.4 0 16.1 4.4 20.5 11.5l88 144c4.5 7.4 4.7 16.7 .5 24.3S368.7 416 360 416L88 416c-8.9 0-17.2-5-21.3-12.9s-3.5-17.5 1.6-24.8l56-80c4.5-6.4 11.8-10.2 19.7-10.2s15.2 3.8 19.7 10.2l26.4 37.8 61.4-100.5c4.4-7.1 12.1-11.5 20.5-11.5z';
 
 exports.definition = {
   prefix: prefix,
@@ -688,32 +856,33 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
 
-exports.faStar = exports.definition;
+exports.faImage = exports.definition;
 exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
 });
 
-var faStar$3 = faStar$2;
+var faImage$1 = faImage;
 
-var faStar = createCommonjsModule$1(function (module, exports) {
+var faMagnifyingGlass = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
-var prefix = 'far';
-var iconName = 'star';
-var width = 576;
+var prefix = 'fas';
+var iconName = 'magnifying-glass';
+var width = 512;
 var height = 512;
-var ligatures = [];
-var unicode = 'f005';
-var svgPathData = 'M528.1 171.5L382 150.2 316.7 17.8c-11.7-23.6-45.6-23.9-57.4 0L194 150.2 47.9 171.5c-26.2 3.8-36.7 36.1-17.7 54.6l105.7 103-25 145.5c-4.5 26.3 23.2 46 46.4 33.7L288 439.6l130.7 68.7c23.2 12.2 50.9-7.4 46.4-33.7l-25-145.5 105.7-103c19-18.5 8.5-50.8-17.7-54.6zM388.6 312.3l23.7 138.4L288 385.4l-124.3 65.3 23.7-138.4-100.6-98 139-20.2 62.2-126 62.2 126 139 20.2-100.6 98z';
+var aliases = [128269,"search"];
+var unicode = 'f002';
+var svgPathData = 'M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376C296.3 401.1 253.9 416 208 416 93.1 416 0 322.9 0 208S93.1 0 208 0 416 93.1 416 208zM208 352a144 144 0 1 0 0-288 144 144 0 1 0 0 288z';
 
 exports.definition = {
   prefix: prefix,
@@ -721,65 +890,60 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
 
-exports.faStar = exports.definition;
+exports.faMagnifyingGlass = exports.definition;
 exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
 });
 
-var faStar$1 = faStar;
+var source$4 = faMagnifyingGlass;
 
 var faSearch = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
-var prefix = 'fas';
-var iconName = 'search';
-var width = 512;
-var height = 512;
-var ligatures = [];
-var unicode = 'f002';
-var svgPathData = 'M505 442.7L405.3 343c-4.5-4.5-10.6-7-17-7H372c27.6-35.3 44-79.7 44-128C416 93.1 322.9 0 208 0S0 93.1 0 208s93.1 208 208 208c48.3 0 92.7-16.4 128-44v16.3c0 6.4 2.5 12.5 7 17l99.7 99.7c9.4 9.4 24.6 9.4 33.9 0l28.3-28.3c9.4-9.4 9.4-24.6.1-34zM208 336c-70.7 0-128-57.2-128-128 0-70.7 57.2-128 128-128 70.7 0 128 57.2 128 128 0 70.7-57.2 128-128 128z';
 
 exports.definition = {
-  prefix: prefix,
-  iconName: iconName,
+  prefix: source$4.prefix,
+  iconName: source$4.iconName,
   icon: [
-    width,
-    height,
-    ligatures,
-    unicode,
-    svgPathData
+    source$4.width,
+    source$4.height,
+    source$4.aliases,
+    source$4.unicode,
+    source$4.svgPathData
   ]};
 
 exports.faSearch = exports.definition;
-exports.prefix = prefix;
-exports.iconName = iconName;
-exports.width = width;
-exports.height = height;
-exports.ligatures = ligatures;
-exports.unicode = unicode;
-exports.svgPathData = svgPathData;
+exports.prefix = source$4.prefix;
+exports.iconName = source$4.iconName;
+exports.width = source$4.width;
+exports.height = source$4.height;
+exports.ligatures = source$4.aliases;
+exports.unicode = source$4.unicode;
+exports.svgPathData = source$4.svgPathData;
+exports.aliases = source$4.aliases;
 });
 
 var faSearch$1 = faSearch;
 
-var faSync = createCommonjsModule$1(function (module, exports) {
+var faArrowsRotate = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
-var iconName = 'sync';
+var iconName = 'arrows-rotate';
 var width = 512;
 var height = 512;
-var ligatures = [];
+var aliases = [128472,"refresh","sync"];
 var unicode = 'f021';
-var svgPathData = 'M440.65 12.57l4 82.77A247.16 247.16 0 0 0 255.83 8C134.73 8 33.91 94.92 12.29 209.82A12 12 0 0 0 24.09 224h49.05a12 12 0 0 0 11.67-9.26 175.91 175.91 0 0 1 317-56.94l-101.46-4.86a12 12 0 0 0-12.57 12v47.41a12 12 0 0 0 12 12H500a12 12 0 0 0 12-12V12a12 12 0 0 0-12-12h-47.37a12 12 0 0 0-11.98 12.57zM255.83 432a175.61 175.61 0 0 1-146-77.8l101.8 4.87a12 12 0 0 0 12.57-12v-47.4a12 12 0 0 0-12-12H12a12 12 0 0 0-12 12V500a12 12 0 0 0 12 12h47.35a12 12 0 0 0 12-12.6l-4.15-82.57A247.17 247.17 0 0 0 255.83 504c121.11 0 221.93-86.92 243.55-201.82a12 12 0 0 0-11.8-14.18h-49.05a12 12 0 0 0-11.67 9.26A175.86 175.86 0 0 1 255.83 432z';
+var svgPathData = 'M65.9 228.5c13.3-93 93.4-164.5 190.1-164.5 53 0 101 21.5 135.8 56.2 .2 .2 .4 .4 .6 .6l7.6 7.2-47.9 0c-17.7 0-32 14.3-32 32s14.3 32 32 32l128 0c17.7 0 32-14.3 32-32l0-128c0-17.7-14.3-32-32-32s-32 14.3-32 32l0 53.4-11.3-10.7C390.5 28.6 326.5 0 256 0 127 0 20.3 95.4 2.6 219.5 .1 237 12.2 253.2 29.7 255.7s33.7-9.7 36.2-27.1zm443.5 64c2.5-17.5-9.7-33.7-27.1-36.2s-33.7 9.7-36.2 27.1c-13.3 93-93.4 164.5-190.1 164.5-53 0-101-21.5-135.8-56.2-.2-.2-.4-.4-.6-.6l-7.6-7.2 47.9 0c17.7 0 32-14.3 32-32s-14.3-32-32-32L32 320c-8.5 0-16.7 3.4-22.7 9.5S-.1 343.7 0 352.3l1 127c.1 17.7 14.6 31.9 32.3 31.7S65.2 496.4 65 478.7l-.4-51.5 10.7 10.1c46.3 46.1 110.2 74.7 180.7 74.7 129 0 235.7-95.4 253.4-219.5z';
 
 exports.definition = {
   prefix: prefix,
@@ -787,19 +951,47 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
 
-exports.faSync = exports.definition;
+exports.faArrowsRotate = exports.definition;
 exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
+});
+
+var source$3 = faArrowsRotate;
+
+var faSync = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+
+exports.definition = {
+  prefix: source$3.prefix,
+  iconName: source$3.iconName,
+  icon: [
+    source$3.width,
+    source$3.height,
+    source$3.aliases,
+    source$3.unicode,
+    source$3.svgPathData
+  ]};
+
+exports.faSync = exports.definition;
+exports.prefix = source$3.prefix;
+exports.iconName = source$3.iconName;
+exports.width = source$3.width;
+exports.height = source$3.height;
+exports.ligatures = source$3.aliases;
+exports.unicode = source$3.unicode;
+exports.svgPathData = source$3.svgPathData;
+exports.aliases = source$3.aliases;
 });
 
 var faSync$1 = faSync;
@@ -810,9 +1002,9 @@ var prefix = 'fas';
 var iconName = 'spinner';
 var width = 512;
 var height = 512;
-var ligatures = [];
+var aliases = [];
 var unicode = 'f110';
-var svgPathData = 'M304 48c0 26.51-21.49 48-48 48s-48-21.49-48-48 21.49-48 48-48 48 21.49 48 48zm-48 368c-26.51 0-48 21.49-48 48s21.49 48 48 48 48-21.49 48-48-21.49-48-48-48zm208-208c-26.51 0-48 21.49-48 48s21.49 48 48 48 48-21.49 48-48-21.49-48-48-48zM96 256c0-26.51-21.49-48-48-48S0 229.49 0 256s21.49 48 48 48 48-21.49 48-48zm12.922 99.078c-26.51 0-48 21.49-48 48s21.49 48 48 48 48-21.49 48-48c0-26.509-21.491-48-48-48zm294.156 0c-26.51 0-48 21.49-48 48s21.49 48 48 48 48-21.49 48-48c0-26.509-21.49-48-48-48zM108.922 60.922c-26.51 0-48 21.49-48 48s21.49 48 48 48 48-21.49 48-48-21.491-48-48-48z';
+var svgPathData = 'M208 48a48 48 0 1 1 96 0 48 48 0 1 1 -96 0zm0 416a48 48 0 1 1 96 0 48 48 0 1 1 -96 0zM48 208a48 48 0 1 1 0 96 48 48 0 1 1 0-96zm368 48a48 48 0 1 1 96 0 48 48 0 1 1 -96 0zM75 369.1A48 48 0 1 1 142.9 437 48 48 0 1 1 75 369.1zM75 75A48 48 0 1 1 142.9 142.9 48 48 0 1 1 75 75zM437 369.1A48 48 0 1 1 369.1 437 48 48 0 1 1 437 369.1z';
 
 exports.definition = {
   prefix: prefix,
@@ -820,7 +1012,7 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
@@ -830,22 +1022,23 @@ exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
 });
 
 var faSpinner$1 = faSpinner;
 
-var faPlusCircle = createCommonjsModule$1(function (module, exports) {
+var faXmark = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
 var prefix = 'fas';
-var iconName = 'plus-circle';
-var width = 512;
+var iconName = 'xmark';
+var width = 384;
 var height = 512;
-var ligatures = [];
-var unicode = 'f055';
-var svgPathData = 'M256 8C119 8 8 119 8 256s111 248 248 248 248-111 248-248S393 8 256 8zm144 276c0 6.6-5.4 12-12 12h-92v92c0 6.6-5.4 12-12 12h-56c-6.6 0-12-5.4-12-12v-92h-92c-6.6 0-12-5.4-12-12v-56c0-6.6 5.4-12 12-12h92v-92c0-6.6 5.4-12 12-12h56c6.6 0 12 5.4 12 12v92h92c6.6 0 12 5.4 12 12v56z';
+var aliases = [128473,10005,10006,10060,215,"close","multiply","remove","times"];
+var unicode = 'f00d';
+var svgPathData = 'M55.1 73.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L147.2 256 9.9 393.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L192.5 301.3 329.9 438.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L237.8 256 375.1 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L192.5 210.7 55.1 73.4z';
 
 exports.definition = {
   prefix: prefix,
@@ -853,151 +1046,47 @@ exports.definition = {
   icon: [
     width,
     height,
-    ligatures,
+    aliases,
     unicode,
     svgPathData
   ]};
 
-exports.faPlusCircle = exports.definition;
+exports.faXmark = exports.definition;
 exports.prefix = prefix;
 exports.iconName = iconName;
 exports.width = width;
 exports.height = height;
-exports.ligatures = ligatures;
+exports.ligatures = aliases;
 exports.unicode = unicode;
 exports.svgPathData = svgPathData;
+exports.aliases = aliases;
 });
 
-var faPlusCircle$1 = faPlusCircle;
-
-var faEye = createCommonjsModule$1(function (module, exports) {
-Object.defineProperty(exports, '__esModule', { value: true });
-var prefix = 'fas';
-var iconName = 'eye';
-var width = 576;
-var height = 512;
-var ligatures = [];
-var unicode = 'f06e';
-var svgPathData = 'M572.52 241.4C518.29 135.59 410.93 64 288 64S57.68 135.64 3.48 241.41a32.35 32.35 0 0 0 0 29.19C57.71 376.41 165.07 448 288 448s230.32-71.64 284.52-177.41a32.35 32.35 0 0 0 0-29.19zM288 400a144 144 0 1 1 144-144 143.93 143.93 0 0 1-144 144zm0-240a95.31 95.31 0 0 0-25.31 3.79 47.85 47.85 0 0 1-66.9 66.9A95.78 95.78 0 1 0 288 160z';
-
-exports.definition = {
-  prefix: prefix,
-  iconName: iconName,
-  icon: [
-    width,
-    height,
-    ligatures,
-    unicode,
-    svgPathData
-  ]};
-
-exports.faEye = exports.definition;
-exports.prefix = prefix;
-exports.iconName = iconName;
-exports.width = width;
-exports.height = height;
-exports.ligatures = ligatures;
-exports.unicode = unicode;
-exports.svgPathData = svgPathData;
-});
-
-var faEye$1 = faEye;
-
-var faMobileAlt = createCommonjsModule$1(function (module, exports) {
-Object.defineProperty(exports, '__esModule', { value: true });
-var prefix = 'fas';
-var iconName = 'mobile-alt';
-var width = 320;
-var height = 512;
-var ligatures = [];
-var unicode = 'f3cd';
-var svgPathData = 'M272 0H48C21.5 0 0 21.5 0 48v416c0 26.5 21.5 48 48 48h224c26.5 0 48-21.5 48-48V48c0-26.5-21.5-48-48-48zM160 480c-17.7 0-32-14.3-32-32s14.3-32 32-32 32 14.3 32 32-14.3 32-32 32zm112-108c0 6.6-5.4 12-12 12H60c-6.6 0-12-5.4-12-12V60c0-6.6 5.4-12 12-12h200c6.6 0 12 5.4 12 12v312z';
-
-exports.definition = {
-  prefix: prefix,
-  iconName: iconName,
-  icon: [
-    width,
-    height,
-    ligatures,
-    unicode,
-    svgPathData
-  ]};
-
-exports.faMobileAlt = exports.definition;
-exports.prefix = prefix;
-exports.iconName = iconName;
-exports.width = width;
-exports.height = height;
-exports.ligatures = ligatures;
-exports.unicode = unicode;
-exports.svgPathData = svgPathData;
-});
-
-var faMobileAlt$1 = faMobileAlt;
-
-var faDesktop = createCommonjsModule$1(function (module, exports) {
-Object.defineProperty(exports, '__esModule', { value: true });
-var prefix = 'fas';
-var iconName = 'desktop';
-var width = 576;
-var height = 512;
-var ligatures = [];
-var unicode = 'f108';
-var svgPathData = 'M528 0H48C21.5 0 0 21.5 0 48v320c0 26.5 21.5 48 48 48h192l-16 48h-72c-13.3 0-24 10.7-24 24s10.7 24 24 24h272c13.3 0 24-10.7 24-24s-10.7-24-24-24h-72l-16-48h192c26.5 0 48-21.5 48-48V48c0-26.5-21.5-48-48-48zm-16 352H64V64h448v288z';
-
-exports.definition = {
-  prefix: prefix,
-  iconName: iconName,
-  icon: [
-    width,
-    height,
-    ligatures,
-    unicode,
-    svgPathData
-  ]};
-
-exports.faDesktop = exports.definition;
-exports.prefix = prefix;
-exports.iconName = iconName;
-exports.width = width;
-exports.height = height;
-exports.ligatures = ligatures;
-exports.unicode = unicode;
-exports.svgPathData = svgPathData;
-});
-
-var faDesktop$1 = faDesktop;
+var source$2 = faXmark;
 
 var faTimes = createCommonjsModule$1(function (module, exports) {
 Object.defineProperty(exports, '__esModule', { value: true });
-var prefix = 'fas';
-var iconName = 'times';
-var width = 352;
-var height = 512;
-var ligatures = [];
-var unicode = 'f00d';
-var svgPathData = 'M242.72 256l100.07-100.07c12.28-12.28 12.28-32.19 0-44.48l-22.24-22.24c-12.28-12.28-32.19-12.28-44.48 0L176 189.28 75.93 89.21c-12.28-12.28-32.19-12.28-44.48 0L9.21 111.45c-12.28 12.28-12.28 32.19 0 44.48L109.28 256 9.21 356.07c-12.28 12.28-12.28 32.19 0 44.48l22.24 22.24c12.28 12.28 32.2 12.28 44.48 0L176 322.72l100.07 100.07c12.28 12.28 32.2 12.28 44.48 0l22.24-22.24c12.28-12.28 12.28-32.19 0-44.48L242.72 256z';
 
 exports.definition = {
-  prefix: prefix,
-  iconName: iconName,
+  prefix: source$2.prefix,
+  iconName: source$2.iconName,
   icon: [
-    width,
-    height,
-    ligatures,
-    unicode,
-    svgPathData
+    source$2.width,
+    source$2.height,
+    source$2.aliases,
+    source$2.unicode,
+    source$2.svgPathData
   ]};
 
 exports.faTimes = exports.definition;
-exports.prefix = prefix;
-exports.iconName = iconName;
-exports.width = width;
-exports.height = height;
-exports.ligatures = ligatures;
-exports.unicode = unicode;
-exports.svgPathData = svgPathData;
+exports.prefix = source$2.prefix;
+exports.iconName = source$2.iconName;
+exports.width = source$2.width;
+exports.height = source$2.height;
+exports.ligatures = source$2.aliases;
+exports.unicode = source$2.unicode;
+exports.svgPathData = source$2.svgPathData;
+exports.aliases = source$2.aliases;
 });
 
 var faTimes$1 = faTimes;
@@ -1006,7 +1095,7 @@ const subscriber_queue$1 = [];
 /**
  * Create a `Writable` store that allows both updating and reading by subscription.
  * @param {*=}value initial value
- * @param {StartStopNotifier=}start start and stop notifications for subscriptions
+ * @param {StartStopNotifier=} start
  */
 function writable$1(value, start = noop$2) {
     let stop;
@@ -1041,7 +1130,7 @@ function writable$1(value, start = noop$2) {
         run(value);
         return () => {
             subscribers.delete(subscriber);
-            if (subscribers.size === 0) {
+            if (subscribers.size === 0 && stop) {
                 stop();
                 stop = null;
             }
@@ -1080,37 +1169,44 @@ const muted = store();
 const layout = store();
 const oldreddit = store();
 const multireddit = store();
+const hideUIonStart = store();
+const apiKey = store();
 
-/* src/components/Settings.svelte generated by Svelte v3.46.2 */
+/* src/components/Settings.svelte generated by Svelte v3.59.2 */
 
 const css$4 = {
-	code: ".settingspanel.svelte-abj757.svelte-abj757{position:fixed;background-color:black;left:25%;top:25%;width:50%;height:50%;border-radius:5px;border:1px solid white;padding:1rem;display:none;grid-template-rows:[head-start] 2.5rem [head-end contents-start] 2fr [contents-end]}.settingspanel.showSettings.svelte-abj757.svelte-abj757{display:grid;grid-gap:1rem}.settingspanel.svelte-abj757 .contents.svelte-abj757{grid-row:contents;display:grid;grid-template-columns:1fr 2fr;overflow:hidden;user-select:none}.settingspanel.svelte-abj757 .contents .nav.svelte-abj757{font-size:1.1rem;display:grid;grid-auto-rows:max-content;grid-gap:5px;align-items:center;justify-items:center;grid-auto-flow:row}.settingspanel.svelte-abj757 .contents .nav .active.svelte-abj757{background-color:rgba(255, 255, 255, 0.2);border-bottom:3px solid white}.settingspanel.svelte-abj757 .contents .nav div.svelte-abj757{padding:0.5rem 1rem;border-bottom:3px solid rgba(0, 0, 0, 0);width:100%;height:100%;cursor:pointer}@media not all and (pointer: coarse){.settingspanel.svelte-abj757 .contents .nav div.svelte-abj757:hover{background-color:rgba(255, 255, 255, 0.2);border-bottom:3px solid white}}.settingspanel.svelte-abj757 .contents .options.svelte-abj757{background-color:rgba(0, 0, 0, 0);border-left:1px solid white;overflow:auto}.settingspanel.svelte-abj757 .contents .options .option.svelte-abj757{display:none;padding:0rem 1rem}.settingspanel.svelte-abj757 .contents .options .option .item.svelte-abj757{padding:0.5rem;margin:0.5rem 0}.settingspanel.svelte-abj757 .contents .options .option .item .text.svelte-abj757{margin-right:10px}.settingspanel.svelte-abj757 .contents .options .option .item .key.svelte-abj757{color:#f9ab00;margin:0 4px;border:1px solid #f9ab00;border-radius:3px;padding:4px 5px}.settingspanel.svelte-abj757 .contents .options .option .item .input input.svelte-abj757{border:1px solid white;background-color:rgba(0, 0, 0, 0);color:white;padding:5px;width:100px}.settingspanel.svelte-abj757 .contents .options .option .item .button.svelte-abj757{border:1px solid white;margin:0 5px;padding:5px;border-radius:3px;cursor:pointer}@media not all and (pointer: coarse){.settingspanel.svelte-abj757 .contents .options .option .item .button.svelte-abj757:hover{background-color:white;color:black}}.settingspanel.svelte-abj757 .contents .options .active.svelte-abj757{display:block}.settingspanel.svelte-abj757 .close.svelte-abj757{position:absolute;top:1rem;color:rgba(255, 255, 255, 0.6);cursor:pointer;right:1rem}@media not all and (pointer: coarse){.settingspanel.svelte-abj757 .close.svelte-abj757:hover{color:white}}.settingspanel.svelte-abj757 .head.svelte-abj757{font-size:1.5rem;align-self:center}.settingspanel.svelte-abj757 .head.svelte-abj757 svg{position:relative;top:3px;margin-right:10px}@media(max-width: 1600px){.settingspanel.svelte-abj757.svelte-abj757{width:80%;left:10%}}@media(max-width: 1000px){.settingspanel.svelte-abj757.svelte-abj757{width:90%;left:5%}}@media(max-width: 800px){.settingspanel.svelte-abj757 .contents.svelte-abj757{grid-template-rows:3rem auto;grid-template-columns:unset}.settingspanel.svelte-abj757 .contents .nav.svelte-abj757{grid-auto-flow:column;grid-auto-rows:unset;grid-auto-columns:max-content}.settingspanel.svelte-abj757 .contents .options.svelte-abj757{border-left-width:0px;border-top:1px solid white}.settingspanel.svelte-abj757 .contents .options .option.svelte-abj757{padding:0}}.tooltip.svelte-abj757.svelte-abj757{position:relative;z-index:2;cursor:pointer}.tooltip.svelte-abj757.svelte-abj757:before{position:absolute;bottom:120%;left:50%;margin-bottom:5px;margin-left:-30px;padding:5px 4px;width:max-content;border-radius:3px;background-color:black;color:#fff;background-color:rgba(255, 255, 255, 0.9);color:black;content:attr(data-tooltip);text-align:center;font-size:0.8rem;line-height:1.2}.tooltip.svelte-abj757.svelte-abj757:after{position:absolute;bottom:120%;left:50%;margin-left:-5px;width:0;border-top:5px solid rgba(255, 255, 255, 0.9);border-right:5px solid transparent;border-left:5px solid transparent;content:\" \";font-size:0;line-height:0}.tooltip.svelte-abj757.svelte-abj757:before,.tooltip.svelte-abj757.svelte-abj757:after{visibility:hidden;opacity:0;pointer-events:none}.tooltip.svelte-abj757.svelte-abj757:hover:before,.tooltip.svelte-abj757.svelte-abj757:hover:after{visibility:visible;opacity:1}",
-	map: "{\"version\":3,\"file\":\"Settings.svelte\",\"sources\":[\"Settings.svelte\"],\"sourcesContent\":[\"<script>\\n  import Icon from \\\"fa-svelte/src/Icon.svelte\\\";\\n  import { faCog as faSettings } from \\\"@fortawesome/free-solid-svg-icons/faCog\\\";\\n  import { faTimes as faClose } from \\\"@fortawesome/free-solid-svg-icons/faTimes\\\";\\n\\n  export let showSettings;\\n\\n  import {\\n    autoplayinterval,\\n    scrollspeed,\\n    prefetch,\\n    prefetchNum,\\n    numCols,\\n    hires,\\n    lores,\\n    oldreddit,\\n    imageVideo,\\n    portraitLandscape,\\n    muted\\n  } from \\\"../_prefs\\\";\\n  autoplayinterval.useLocalStorage(3);\\n  scrollspeed.useLocalStorage(2);\\n  prefetch.useLocalStorage(true);\\n  prefetchNum.useLocalStorage(50);\\n  numCols.useLocalStorage(3);\\n  hires.useLocalStorage(false);\\n  lores.useLocalStorage(false);\\n  oldreddit.useLocalStorage(false);\\n  imageVideo.useLocalStorage(0);\\n  portraitLandscape.useLocalStorage(0);\\n  muted.useLocalStorage(true);\\n\\n  function hideSettings() {\\n    showSettings = false;\\n  }\\n\\n  let activeTab = 1;\\n\\n  let _autoplayinterval = $autoplayinterval;\\n  let _scrollspeed = $scrollspeed;\\n  let _hires = $hires;\\n  let _lores = $lores;\\n  let _oldreddit = $oldreddit;\\n  let _prefetch = $prefetch;\\n  let _prefetchNum = $prefetchNum;\\n  let _numCols = $numCols;\\n  let _muted = $muted;\\n  let _imageVideo = $imageVideo;\\n  let _portraitLandscape = $portraitLandscape;\\n\\n  let imagesVideoStates = [\\n    \\\"Both images and videos\\\",\\n    \\\"Videos only\\\",\\n    \\\"Images only\\\"\\n  ];\\n  let portraitLandscapeStates = [\\n    \\\"Both landscape and portrait\\\",\\n    \\\"Portrait only\\\",\\n    \\\"Landscape only\\\"\\n  ];\\n\\n  $: {\\n    let i = Math.round(_autoplayinterval);\\n    if (i) {\\n      autoplayinterval.set(i);\\n    }\\n\\n    let j = Math.round(_scrollspeed);\\n    if (j >= 20) {\\n      scrollspeed.set(10);\\n    } else {\\n      scrollspeed.set(j);\\n    }\\n\\n    let k = Math.round(_prefetchNum);\\n    if (k) {\\n      prefetchNum.set(k);\\n    }\\n\\n    let l = Math.round(_numCols);\\n    if (l) {\\n      numCols.set(l);\\n    }\\n  }\\n\\n  function toggleOldReddit() {\\n    _oldreddit = !_oldreddit;\\n\\n    oldreddit.set(_oldreddit);\\n  }\\n\\n  function toggleImageVideo() {\\n    _imageVideo = _imageVideo + 1;\\n\\n    if (_imageVideo == 3) {\\n      _imageVideo = 0;\\n    }\\n\\n    imageVideo.set(_imageVideo);\\n  }\\n  function togglePortraitLandscape() {\\n    _portraitLandscape = _portraitLandscape + 1;\\n\\n    if (_portraitLandscape == 3) {\\n      _portraitLandscape = 0;\\n    }\\n\\n    portraitLandscape.set(_portraitLandscape);\\n  }\\n\\n  function toggleHiRes() {\\n    _hires = !_hires;\\n\\n    hires.set(_hires);\\n  }\\n\\n  function toggleLoRes() {\\n    _lores = !_lores;\\n\\n    lores.set(_lores);\\n  }\\n\\n  function togglePrefetch() {\\n    _prefetch = !_prefetch;\\n\\n    prefetch.set(_prefetch);\\n  }\\n\\n  function toggleMuted() {\\n    _muted = !_muted;\\n\\n    muted.set(_muted);\\n  }\\n</script>\\n\\n<div class=\\\"settingspanel\\\" class:showSettings=\\\"{showSettings}\\\"><div class=\\\"head\\\"><Icon icon=\\\"{faSettings}\\\"></Icon>Settings</div><div class=\\\"close\\\" on:click=\\\"{hideSettings}\\\"><Icon icon=\\\"{faClose}\\\"></Icon></div><div class=\\\"contents\\\"><div class=\\\"nav\\\"><div class:active=\\\"{activeTab == 1}\\\" on:click=\\\"{function(){activeTab = 1}}\\\">General</div><div class:active=\\\"{activeTab == 2}\\\" on:click=\\\"{function(){activeTab = 2}}\\\">Keybindings</div></div><div class=\\\"options\\\"><div class=\\\"option\\\" class:active=\\\"{activeTab == 1}\\\"><!--p autoplay on/off--><!--p download files--><!--p nsfw on/off--><div class=\\\"item\\\"><span class=\\\"text\\\">Autoplay time (seconds)</span><span class=\\\"input\\\"><input type=\\\"number\\\" bind:value=\\\"{_autoplayinterval}\\\"></span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Scroll speed (0-20)</span><span class=\\\"input\\\"><input type=\\\"number\\\" bind:value=\\\"{_scrollspeed}\\\"></span></div><!--.item--><!--  span Favorite--><!--    span--><!--      span.button Mark all--><!--      span.button Unmark all--><!--      span.button Unmark all (all subreddits)--><div class=\\\"item\\\"><span class=\\\"tooltip\\\" data-tooltip=\\\"Preload media in the background\\\">Prefetch media</span><span><span class=\\\"button\\\" on:click=\\\"{togglePrefetch}\\\">{_prefetch ? \\\"Prefetch is on\\\" : \\\"Prefetch is off\\\"}</span></span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Prefetch items</span><span class=\\\"input\\\"><input type=\\\"number\\\" bind:value=\\\"{_prefetchNum}\\\"></span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Number of columns in grid mode</span><span class=\\\"input\\\"><input type=\\\"number\\\" bind:value=\\\"{_numCols}\\\"></span></div><div class=\\\"item\\\"><span class=\\\"tooltip\\\" data-tooltip=\\\"Sound on/off\\\">Sound</span><span><span class=\\\"button\\\" on:click=\\\"{toggleMuted}\\\">{_muted ? \\\"Sound is off\\\" : \\\"Sound is on\\\"}</span></span></div><div class=\\\"item\\\"><span class=\\\"text tooltip\\\" data-tooltip=\\\"Choose what type of image to display\\\">Display image resolution</span><span><span class=\\\"button\\\" on:click=\\\"{toggleHiRes}\\\">{_hires ? \\\"Original (slow)\\\" : \\\"Optimized (fast)\\\"}</span></span></div><div class=\\\"item\\\"><span class=\\\"text tooltip\\\" data-tooltip=\\\"Choose what type of video to display\\\">Display video resolution</span><span><span class=\\\"button\\\" on:click=\\\"{toggleLoRes}\\\">{_lores ? \\\"Prefer lo-res (fast)\\\": \\\"Original (slow)\\\"}</span></span></div><div class=\\\"item\\\"><span class=\\\"text tooltip\\\" data-tooltip=\\\"Choose whether to go to reddit.com or old.reddit.com\\\">reddit.com link handling</span><span><span class=\\\"button\\\" on:click=\\\"{toggleOldReddit}\\\">{_oldreddit ? \\\"old.reddit.com\\\" : \\\"reddit.com (New)\\\"}</span></span></div><div class=\\\"item\\\"><span class=\\\"text tooltip\\\" data-tooltip=\\\"Choose whether to show videos only, images only or both\\\">Display images/videos/both</span><span><span class=\\\"button\\\" on:click=\\\"{toggleImageVideo}\\\">{imagesVideoStates[_imageVideo]}</span></span></div><div class=\\\"item\\\"><span class=\\\"text tooltip\\\" data-tooltip=\\\"Choose whether to show portrait only, landscape only or both\\\">Display portrait/landscape/both</span><span><span class=\\\"button\\\" on:click=\\\"{togglePortraitLandscape}\\\">{portraitLandscapeStates[_portraitLandscape]}</span></span></div><!--p remove duplicates--><!--p aggressive caching (thumb vs preview)--></div><div class=\\\"option\\\" class:active=\\\"{activeTab == 2}\\\"><div class=\\\"item\\\"><span class=\\\"text\\\">Play / Pause</span><span class=\\\"key\\\">q</span><span class=\\\"key\\\">p</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Next item</span><span class=\\\"key\\\">Space</span><span class=\\\"key\\\">Right</span><span class=\\\"key\\\">d</span><span class=\\\"key\\\">j</span><span class=\\\"key\\\">Page-down</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Previous item</span><span class=\\\"key\\\">Left</span><span class=\\\"key\\\">a</span><span class=\\\"key\\\">k</span><span class=\\\"key\\\">Page-up</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Next item in the album</span><span class=\\\"key\\\">Up</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Previous item in the album</span><span class=\\\"key\\\">Down</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Hide UI / Controls</span><span class=\\\"key\\\">h</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Toggle favorite</span><span class=\\\"key\\\">x</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Toggle Sound</span><span class=\\\"key\\\">s</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Remove all favorites</span><span class=\\\"key\\\">Shift + x</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Remove all favorites (across all subreddits)</span><span class=\\\"key\\\">Ctrl + Shift + x</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Filter</span><span class=\\\"key\\\">/</span><span class=\\\"key\\\">f</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Open reddit (old.reddit.com)</span><span class=\\\"key\\\">o</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Open reddit</span><span class=\\\"key\\\">r</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Open high-res</span><span class=\\\"key\\\">i</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Add to multireddit</span><span class=\\\"key\\\">m</span></div></div></div></div></div>\\n\\n<style lang=\\\"sass\\\">.settingspanel {\\n  position: fixed;\\n  background-color: black;\\n  left: 25%;\\n  top: 25%;\\n  width: 50%;\\n  height: 50%;\\n  border-radius: 5px;\\n  border: 1px solid white;\\n  padding: 1rem;\\n  display: none;\\n  grid-template-rows: [head-start] 2.5rem [head-end contents-start] 2fr [contents-end];\\n}\\n.settingspanel.showSettings {\\n  display: grid;\\n  grid-gap: 1rem;\\n}\\n.settingspanel .contents {\\n  grid-row: contents;\\n  display: grid;\\n  grid-template-columns: 1fr 2fr;\\n  overflow: hidden;\\n  user-select: none;\\n}\\n.settingspanel .contents .nav {\\n  font-size: 1.1rem;\\n  display: grid;\\n  grid-auto-rows: max-content;\\n  grid-gap: 5px;\\n  align-items: center;\\n  justify-items: center;\\n  grid-auto-flow: row;\\n}\\n.settingspanel .contents .nav .active {\\n  background-color: rgba(255, 255, 255, 0.2);\\n  border-bottom: 3px solid white;\\n}\\n.settingspanel .contents .nav div {\\n  padding: 0.5rem 1rem;\\n  border-bottom: 3px solid rgba(0, 0, 0, 0);\\n  width: 100%;\\n  height: 100%;\\n  cursor: pointer;\\n}\\n@media not all and (pointer: coarse) {\\n  .settingspanel .contents .nav div:hover {\\n    background-color: rgba(255, 255, 255, 0.2);\\n    border-bottom: 3px solid white;\\n  }\\n}\\n.settingspanel .contents .options {\\n  background-color: rgba(0, 0, 0, 0);\\n  border-left: 1px solid white;\\n  overflow: auto;\\n}\\n.settingspanel .contents .options .option {\\n  display: none;\\n  padding: 0rem 1rem;\\n}\\n.settingspanel .contents .options .option .item {\\n  padding: 0.5rem;\\n  margin: 0.5rem 0;\\n}\\n.settingspanel .contents .options .option .item .text {\\n  margin-right: 10px;\\n}\\n.settingspanel .contents .options .option .item .key {\\n  color: #f9ab00;\\n  margin: 0 4px;\\n  border: 1px solid #f9ab00;\\n  border-radius: 3px;\\n  padding: 4px 5px;\\n}\\n.settingspanel .contents .options .option .item .input input {\\n  border: 1px solid white;\\n  background-color: rgba(0, 0, 0, 0);\\n  color: white;\\n  padding: 5px;\\n  width: 100px;\\n}\\n.settingspanel .contents .options .option .item .button {\\n  border: 1px solid white;\\n  margin: 0 5px;\\n  padding: 5px;\\n  border-radius: 3px;\\n  cursor: pointer;\\n}\\n@media not all and (pointer: coarse) {\\n  .settingspanel .contents .options .option .item .button:hover {\\n    background-color: white;\\n    color: black;\\n  }\\n}\\n.settingspanel .contents .options .active {\\n  display: block;\\n}\\n.settingspanel .close {\\n  position: absolute;\\n  top: 1rem;\\n  color: rgba(255, 255, 255, 0.6);\\n  cursor: pointer;\\n  right: 1rem;\\n}\\n@media not all and (pointer: coarse) {\\n  .settingspanel .close:hover {\\n    color: white;\\n  }\\n}\\n.settingspanel .head {\\n  font-size: 1.5rem;\\n  align-self: center;\\n}\\n.settingspanel .head :global(svg) {\\n  position: relative;\\n  top: 3px;\\n  margin-right: 10px;\\n}\\n@media (max-width: 1600px) {\\n  .settingspanel {\\n    width: 80%;\\n    left: 10%;\\n  }\\n}\\n@media (max-width: 1000px) {\\n  .settingspanel {\\n    width: 90%;\\n    left: 5%;\\n  }\\n}\\n@media (max-width: 800px) {\\n  .settingspanel .contents {\\n    grid-template-rows: 3rem auto;\\n    grid-template-columns: unset;\\n  }\\n  .settingspanel .contents .nav {\\n    grid-auto-flow: column;\\n    grid-auto-rows: unset;\\n    grid-auto-columns: max-content;\\n  }\\n  .settingspanel .contents .options {\\n    border-left-width: 0px;\\n    border-top: 1px solid white;\\n  }\\n  .settingspanel .contents .options .option {\\n    padding: 0;\\n  }\\n}\\n\\n.tooltip {\\n  position: relative;\\n  z-index: 2;\\n  cursor: pointer;\\n}\\n\\n.ttbefore, .tooltip.bottom:before, .tooltip:before {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-bottom: 5px;\\n  margin-left: -30px;\\n  padding: 5px 4px;\\n  width: max-content;\\n  border-radius: 3px;\\n  background-color: black;\\n  color: #fff;\\n  background-color: rgba(255, 255, 255, 0.9);\\n  color: black;\\n  content: attr(data-tooltip);\\n  text-align: center;\\n  font-size: 0.8rem;\\n  line-height: 1.2;\\n}\\n\\n.ttafter, .tooltip.bottom:after, .tooltip:after {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-left: -5px;\\n  width: 0;\\n  border-top: 5px solid rgba(255, 255, 255, 0.9);\\n  border-right: 5px solid transparent;\\n  border-left: 5px solid transparent;\\n  content: \\\" \\\";\\n  font-size: 0;\\n  line-height: 0;\\n}\\n\\n.tooltip:before, .tooltip:after {\\n  visibility: hidden;\\n  opacity: 0;\\n  pointer-events: none;\\n}\\n.tooltip.bottom:before {\\n  bottom: -170%;\\n}\\n.tooltip.bottom:after {\\n  bottom: -40%;\\n  border-bottom: 5px solid rgba(255, 255, 255, 0.9);\\n  border-top: 5px solid transparent;\\n}\\n.tooltip:hover:before, .tooltip:hover:after {\\n  visibility: visible;\\n  opacity: 1;\\n}</style>\\n\"],\"names\":[],\"mappings\":\"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\"}"
+	code: ".settingspanel.svelte-1sqtgrn.svelte-1sqtgrn.svelte-1sqtgrn{position:fixed;background-color:#1a1a1a;left:50%;top:50%;transform:translate(-50%, -50%);width:800px;height:520px;border-radius:12px;border:none;box-shadow:0 20px 40px rgba(0, 0, 0, 0.4);backdrop-filter:blur(20px);padding:0;display:none;overflow:hidden;z-index:9999;grid-template-rows:[head-start] 60px [head-end contents-start] 1fr [contents-end]}.settingspanel.showSettings.svelte-1sqtgrn.svelte-1sqtgrn.svelte-1sqtgrn{display:grid;grid-gap:0}.settingspanel.svelte-1sqtgrn .head.svelte-1sqtgrn.svelte-1sqtgrn{grid-row:head;display:flex;align-items:center;justify-content:center;background-color:#222;color:#fff;font-size:18px;font-weight:600;border-bottom:1px solid #333;position:relative}.settingspanel.svelte-1sqtgrn .head.svelte-1sqtgrn svg{margin-right:10px;width:20px;height:20px}.settingspanel.svelte-1sqtgrn .close.svelte-1sqtgrn.svelte-1sqtgrn{position:absolute;top:15px;right:20px;color:#888;cursor:pointer;width:30px;height:30px;display:flex;align-items:center;justify-content:center;border-radius:6px;transition:all 0.2s ease}@media not all and (pointer: coarse){.settingspanel.svelte-1sqtgrn .close.svelte-1sqtgrn.svelte-1sqtgrn:hover{background-color:#333;color:#fff}}.settingspanel.svelte-1sqtgrn .close.svelte-1sqtgrn svg{width:16px;height:16px}.settingspanel.svelte-1sqtgrn .contents.svelte-1sqtgrn.svelte-1sqtgrn{grid-row:contents;display:grid;grid-template-columns:180px 1fr;overflow:hidden;user-select:none;background-color:#1a1a1a}.settingspanel.svelte-1sqtgrn .contents .nav.svelte-1sqtgrn.svelte-1sqtgrn{font-size:14px;font-weight:400;background-color:#222;border-right:1px solid #333;padding:20px 0;display:flex;flex-direction:column;gap:0;align-items:stretch}.settingspanel.svelte-1sqtgrn .contents .nav div.svelte-1sqtgrn.svelte-1sqtgrn{padding:12px 20px;cursor:pointer;transition:all 0.2s ease;color:#ccc;border-left:3px solid transparent}@media not all and (pointer: coarse){.settingspanel.svelte-1sqtgrn .contents .nav div.svelte-1sqtgrn.svelte-1sqtgrn:hover{background-color:#2a2a2a;color:#fff}}.settingspanel.svelte-1sqtgrn .contents .nav div.active.svelte-1sqtgrn.svelte-1sqtgrn{background-color:#2a2a2a;color:#fff;border-left-color:#00b4d8}.settingspanel.svelte-1sqtgrn .contents .options.svelte-1sqtgrn.svelte-1sqtgrn{background-color:#1a1a1a;border-left:none;overflow-y:auto;padding:15px 20px 10px 20px;max-height:100%}.settingspanel.svelte-1sqtgrn .contents .options .option.svelte-1sqtgrn.svelte-1sqtgrn{display:none}.settingspanel.svelte-1sqtgrn .contents .options .option.active.svelte-1sqtgrn.svelte-1sqtgrn{display:block}.settingspanel.svelte-1sqtgrn .contents .options .option .item.svelte-1sqtgrn.svelte-1sqtgrn{padding:8px 0;margin:0;border-bottom:1px solid #333;display:flex;align-items:center;justify-content:flex-start;min-height:40px;flex-wrap:wrap;gap:20px}.settingspanel.svelte-1sqtgrn .contents .options .option .item.svelte-1sqtgrn.svelte-1sqtgrn:last-child{border-bottom:none}.settingspanel.svelte-1sqtgrn .contents .options .option .item .text.svelte-1sqtgrn.svelte-1sqtgrn{color:#fff;font-size:14px;font-weight:400;min-width:200px;white-space:nowrap;flex-shrink:0}.settingspanel.svelte-1sqtgrn .contents .options .option .item .key.svelte-1sqtgrn.svelte-1sqtgrn{color:#ccc;margin:0 4px;border:1px solid #555;border-radius:6px;padding:6px 8px;font-size:12px;font-weight:500;white-space:nowrap}.settingspanel.svelte-1sqtgrn .contents .options .option .item .api-key-help.svelte-1sqtgrn.svelte-1sqtgrn{margin:0;font-size:12px;flex-shrink:0}.settingspanel.svelte-1sqtgrn .contents .options .option .item .api-key-help a.svelte-1sqtgrn.svelte-1sqtgrn{color:#00b4d8;text-decoration:none;transition:all 0.2s ease}@media not all and (pointer: coarse){.settingspanel.svelte-1sqtgrn .contents .options .option .item .api-key-help a.svelte-1sqtgrn.svelte-1sqtgrn:hover{text-decoration:underline;opacity:0.8}}.settingspanel.svelte-1sqtgrn .contents .options .option .item .input.svelte-1sqtgrn.svelte-1sqtgrn{display:flex;flex-direction:column;align-items:flex-start;min-width:300px;flex-shrink:0;gap:5px}.settingspanel.svelte-1sqtgrn .contents .options .option .item .input input.svelte-1sqtgrn.svelte-1sqtgrn{border:1px solid #444;background-color:#2a2a2a;color:#fff;padding:8px 12px;border-radius:6px;width:300px;font-size:14px;transition:all 0.2s ease}.settingspanel.svelte-1sqtgrn .contents .options .option .item .input input.svelte-1sqtgrn.svelte-1sqtgrn:focus{outline:none;border-color:#00b4d8;box-shadow:0 0 0 2px rgba(0, 180, 216, 0.2)}.settingspanel.svelte-1sqtgrn .contents .options .option .item .input input[type=number].svelte-1sqtgrn.svelte-1sqtgrn{width:100px}@media not all and (pointer: coarse){}.settingspanel.svelte-1sqtgrn .switch.svelte-1sqtgrn.svelte-1sqtgrn{position:relative;display:inline-block;width:50px;height:24px}.settingspanel.svelte-1sqtgrn .switch input.svelte-1sqtgrn.svelte-1sqtgrn{opacity:0;width:0;height:0}.settingspanel.svelte-1sqtgrn .switch .slider.svelte-1sqtgrn.svelte-1sqtgrn{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background-color:#444;transition:0.3s;border-radius:24px}.settingspanel.svelte-1sqtgrn .switch .slider.svelte-1sqtgrn.svelte-1sqtgrn:before{position:absolute;content:\"\";height:18px;width:18px;left:3px;bottom:3px;background-color:white;transition:0.3s;border-radius:50%}.settingspanel.svelte-1sqtgrn .switch input.svelte-1sqtgrn:checked+.slider.svelte-1sqtgrn{background-color:#00b4d8}.settingspanel.svelte-1sqtgrn .switch input.svelte-1sqtgrn:focus+.slider.svelte-1sqtgrn{box-shadow:0 0 1px #00b4d8}.settingspanel.svelte-1sqtgrn .switch input.svelte-1sqtgrn:checked+.slider.svelte-1sqtgrn:before{transform:translateX(26px)}.settingspanel.svelte-1sqtgrn .switch.round .slider.svelte-1sqtgrn.svelte-1sqtgrn{border-radius:24px}.settingspanel.svelte-1sqtgrn .switch.round .slider.svelte-1sqtgrn.svelte-1sqtgrn:before{border-radius:50%}@media(max-width: 800px){.settingspanel.svelte-1sqtgrn.svelte-1sqtgrn.svelte-1sqtgrn{width:90vw;height:80vh;max-width:600px;max-height:500px}.contents.svelte-1sqtgrn.svelte-1sqtgrn.svelte-1sqtgrn{grid-template-columns:150px 1fr}.options.svelte-1sqtgrn.svelte-1sqtgrn.svelte-1sqtgrn{padding:20px}.item.svelte-1sqtgrn.svelte-1sqtgrn.svelte-1sqtgrn{flex-direction:column;align-items:flex-start;gap:10px}.item.svelte-1sqtgrn .input.svelte-1sqtgrn.svelte-1sqtgrn{align-items:flex-start;width:100%}.item.svelte-1sqtgrn .input input.svelte-1sqtgrn.svelte-1sqtgrn{width:100%;max-width:300px}}",
+	map: "{\"version\":3,\"file\":\"Settings.svelte\",\"sources\":[\"Settings.svelte\"],\"sourcesContent\":[\"<script>\\n  import { createEventDispatcher } from 'svelte';\\n  const dispatch = createEventDispatcher();\\n\\n  import Icon from \\\"fa-svelte/src/Icon.svelte\\\";\\n  import { faCog as faSettings } from \\\"@fortawesome/free-solid-svg-icons/faCog\\\";\\n  import { faTimes as faClose } from \\\"@fortawesome/free-solid-svg-icons/faTimes\\\";\\n\\n  export let showSettings;\\n\\n  import {\\n    autoplayinterval,\\n    scrollspeed,\\n    prefetch,\\n    prefetchNum,\\n    numCols,\\n    hires,\\n    lores,\\n    oldreddit,\\n    imageVideo,\\n    portraitLandscape,\\n    muted,\\n    hideUIonStart,\\n    apiKey\\n  } from \\\"../_prefs\\\";\\n  autoplayinterval.useLocalStorage(3);\\n  scrollspeed.useLocalStorage(2);\\n  prefetch.useLocalStorage(true);\\n  prefetchNum.useLocalStorage(50);\\n  numCols.useLocalStorage(3);\\n  hires.useLocalStorage(false);\\n  lores.useLocalStorage(false);\\n  oldreddit.useLocalStorage(false);\\n  imageVideo.useLocalStorage(0);\\n  portraitLandscape.useLocalStorage(0);\\n  muted.useLocalStorage(true);\\n  hideUIonStart.useLocalStorage(true);\\n  apiKey.useLocalStorage('');\\n\\n  function hideSettings() {\\n    showSettings = false;\\n  }\\n\\n  let activeTab = 1;\\n\\n  let _autoplayinterval = $autoplayinterval;\\n  let _scrollspeed = $scrollspeed;\\n  let _hires = $hires;\\n  let _lores = $lores;\\n  let _oldreddit = $oldreddit;\\n  let _prefetch = $prefetch;\\n  let _prefetchNum = $prefetchNum;\\n  let _numCols = $numCols;\\n  let _muted = $muted;\\n  let _imageVideo = $imageVideo;\\n  let _portraitLandscape = $portraitLandscape;\\n  let _hideUIonStart = $hideUIonStart;\\n  let _apiKey = $apiKey;\\n\\n  $: hideUIonStart.set(_hideUIonStart);\\n  $: {\\n    apiKey.set(_apiKey);\\n    if (_apiKey) {\\n      dispatch('apiKeyChange', _apiKey);\\n    }\\n  }\\n\\n  let imagesVideoStates = [\\n    \\\"Both images and videos\\\",\\n    \\\"Videos only\\\",\\n    \\\"Images only\\\"\\n  ];\\n  let portraitLandscapeStates = [\\n    \\\"Both landscape and portrait\\\",\\n    \\\"Portrait only\\\",\\n    \\\"Landscape only\\\"\\n  ];\\n\\n  $: {\\n    let i = Math.round(_autoplayinterval);\\n    if (i) {\\n      autoplayinterval.set(i);\\n    }\\n\\n    let j = Math.round(_scrollspeed);\\n    if (j >= 20) {\\n      scrollspeed.set(10);\\n    } else {\\n      scrollspeed.set(j);\\n    }\\n\\n    let k = Math.round(_prefetchNum);\\n    if (k) {\\n      prefetchNum.set(k);\\n    }\\n\\n    let l = Math.round(_numCols);\\n    if (l) {\\n      numCols.set(l);\\n    }\\n  }\\n\\n  function toggleOldReddit() {\\n    _oldreddit = !_oldreddit;\\n    oldreddit.set(_oldreddit);\\n  }\\n\\n  function toggleImageVideo() {\\n    _imageVideo = _imageVideo + 1;\\n    if (_imageVideo == 3) {\\n      _imageVideo = 0;\\n    }\\n    imageVideo.set(_imageVideo);\\n  }\\n  \\n  function togglePortraitLandscape() {\\n    _portraitLandscape = _portraitLandscape + 1;\\n    if (_portraitLandscape == 3) {\\n      _portraitLandscape = 0;\\n    }\\n    portraitLandscape.set(_portraitLandscape);\\n  }\\n\\n  function toggleHiRes() {\\n    _hires = !_hires;\\n    hires.set(_hires);\\n  }\\n\\n  function toggleLoRes() {\\n    _lores = !_lores;\\n    lores.set(_lores);\\n  }\\n\\n  function toggleMuted() {\\n    _muted = !_muted;\\n    muted.set(_muted);\\n  }\\n\\n  function toggleHideUIonStart() {\\n    _hideUIonStart = !_hideUIonStart;\\n    hideUIonStart.set(_hideUIonStart);\\n  }\\n</script>\\n\\n<div class=\\\"settingspanel\\\" class:showSettings=\\\"{showSettings}\\\"><div class=\\\"head\\\"><Icon icon=\\\"{faSettings}\\\"></Icon>Settings</div><div class=\\\"close\\\" on:click=\\\"{hideSettings}\\\"><Icon icon=\\\"{faClose}\\\"></Icon></div><div class=\\\"contents\\\"><div class=\\\"nav\\\"><div class:active=\\\"{activeTab == 1}\\\" on:click=\\\"{function(){activeTab = 1}}\\\">General</div><div class:active=\\\"{activeTab == 2}\\\" on:click=\\\"{function(){activeTab = 2}}\\\">Keybindings</div></div><div class=\\\"options\\\"><div class=\\\"option\\\" class:active=\\\"{activeTab == 1}\\\"><div class=\\\"item\\\"><span class=\\\"text\\\">Autoplay Duration (seconds)</span><span class=\\\"input\\\"><input type=\\\"number\\\" bind:value=\\\"{_autoplayinterval}\\\" min=\\\"0\\\" max=\\\"60\\\"></span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Scroll Speed (0-20)</span><span class=\\\"input\\\"><input type=\\\"number\\\" bind:value=\\\"{_scrollspeed}\\\" min=\\\"0\\\" max=\\\"20\\\"></span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Prefetch Count</span><span class=\\\"input\\\"><input type=\\\"number\\\" bind:value=\\\"{_prefetchNum}\\\" min=\\\"1\\\" max=\\\"200\\\"></span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Hide UI on Startup</span><label class=\\\"switch\\\"><input type=\\\"checkbox\\\" bind:checked=\\\"{_hideUIonStart}\\\"><span class=\\\"slider round\\\"></span></label></div><div class=\\\"item\\\"><span class=\\\"text\\\">Tumblr API Key</span><span class=\\\"input\\\"><input type=\\\"text\\\" bind:value=\\\"{_apiKey}\\\" placeholder=\\\"Enter your OAuth Consumer Key\\\"></span><div class=\\\"api-key-help\\\"><a href=\\\"https://www.tumblr.com/oauth/apps\\\" target=\\\"_blank\\\">Get API Key Here</a></div></div></div><div class=\\\"option\\\" class:active=\\\"{activeTab == 2}\\\"><div class=\\\"item\\\"><span class=\\\"text\\\">Play / Pause</span><span class=\\\"key\\\">q</span><span class=\\\"key\\\">p</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Next Item</span><span class=\\\"key\\\">Space</span><span class=\\\"key\\\">Right</span><span class=\\\"key\\\">d</span><span class=\\\"key\\\">j</span><span class=\\\"key\\\">Page-down</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Previous Item</span><span class=\\\"key\\\">Left</span><span class=\\\"key\\\">a</span><span class=\\\"key\\\">k</span><span class=\\\"key\\\">Page-up</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Next Album Item</span><span class=\\\"key\\\">Up</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Previous Album Item</span><span class=\\\"key\\\">Down</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Toggle UI</span><span class=\\\"key\\\">h</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Toggle Sound</span><span class=\\\"key\\\">s</span></div><div class=\\\"item\\\"><span class=\\\"text\\\">Open on Tumblr</span><span class=\\\"key\\\">o</span></div></div></div></div></div>\\n\\n<style lang=\\\"sass\\\">.settingspanel {\\n  position: fixed;\\n  background-color: #1a1a1a;\\n  left: 50%;\\n  top: 50%;\\n  transform: translate(-50%, -50%);\\n  width: 800px;\\n  height: 520px;\\n  border-radius: 12px;\\n  border: none;\\n  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);\\n  backdrop-filter: blur(20px);\\n  padding: 0;\\n  display: none;\\n  overflow: hidden;\\n  z-index: 9999;\\n  grid-template-rows: [head-start] 60px [head-end contents-start] 1fr [contents-end];\\n}\\n.settingspanel.showSettings {\\n  display: grid;\\n  grid-gap: 0;\\n}\\n.settingspanel .head {\\n  grid-row: head;\\n  display: flex;\\n  align-items: center;\\n  justify-content: center;\\n  background-color: #222;\\n  color: #fff;\\n  font-size: 18px;\\n  font-weight: 600;\\n  border-bottom: 1px solid #333;\\n  position: relative;\\n}\\n.settingspanel .head :global(svg) {\\n  margin-right: 10px;\\n  width: 20px;\\n  height: 20px;\\n}\\n.settingspanel .close {\\n  position: absolute;\\n  top: 15px;\\n  right: 20px;\\n  color: #888;\\n  cursor: pointer;\\n  width: 30px;\\n  height: 30px;\\n  display: flex;\\n  align-items: center;\\n  justify-content: center;\\n  border-radius: 6px;\\n  transition: all 0.2s ease;\\n}\\n@media not all and (pointer: coarse) {\\n  .settingspanel .close:hover {\\n    background-color: #333;\\n    color: #fff;\\n  }\\n}\\n.settingspanel .close :global(svg) {\\n  width: 16px;\\n  height: 16px;\\n}\\n.settingspanel .contents {\\n  grid-row: contents;\\n  display: grid;\\n  grid-template-columns: 180px 1fr;\\n  overflow: hidden;\\n  user-select: none;\\n  background-color: #1a1a1a;\\n}\\n.settingspanel .contents .nav {\\n  font-size: 14px;\\n  font-weight: 400;\\n  background-color: #222;\\n  border-right: 1px solid #333;\\n  padding: 20px 0;\\n  display: flex;\\n  flex-direction: column;\\n  gap: 0;\\n  align-items: stretch;\\n}\\n.settingspanel .contents .nav div {\\n  padding: 12px 20px;\\n  cursor: pointer;\\n  transition: all 0.2s ease;\\n  color: #ccc;\\n  border-left: 3px solid transparent;\\n}\\n@media not all and (pointer: coarse) {\\n  .settingspanel .contents .nav div:hover {\\n    background-color: #2a2a2a;\\n    color: #fff;\\n  }\\n}\\n.settingspanel .contents .nav div.active {\\n  background-color: #2a2a2a;\\n  color: #fff;\\n  border-left-color: #00b4d8;\\n}\\n.settingspanel .contents .options {\\n  background-color: #1a1a1a;\\n  border-left: none;\\n  overflow-y: auto;\\n  padding: 15px 20px 10px 20px;\\n  max-height: 100%;\\n}\\n.settingspanel .contents .options .option {\\n  display: none;\\n}\\n.settingspanel .contents .options .option.active {\\n  display: block;\\n}\\n.settingspanel .contents .options .option .item {\\n  padding: 8px 0;\\n  margin: 0;\\n  border-bottom: 1px solid #333;\\n  display: flex;\\n  align-items: center;\\n  justify-content: flex-start;\\n  min-height: 40px;\\n  flex-wrap: wrap;\\n  gap: 20px;\\n}\\n.settingspanel .contents .options .option .item:last-child {\\n  border-bottom: none;\\n}\\n.settingspanel .contents .options .option .item .text {\\n  color: #fff;\\n  font-size: 14px;\\n  font-weight: 400;\\n  min-width: 200px;\\n  white-space: nowrap;\\n  flex-shrink: 0;\\n}\\n.settingspanel .contents .options .option .item .key {\\n  color: #ccc;\\n  margin: 0 4px;\\n  border: 1px solid #555;\\n  border-radius: 6px;\\n  padding: 6px 8px;\\n  font-size: 12px;\\n  font-weight: 500;\\n  white-space: nowrap;\\n}\\n.settingspanel .contents .options .option .item .api-key-help {\\n  margin: 0;\\n  font-size: 12px;\\n  flex-shrink: 0;\\n}\\n.settingspanel .contents .options .option .item .api-key-help a {\\n  color: #00b4d8;\\n  text-decoration: none;\\n  transition: all 0.2s ease;\\n}\\n@media not all and (pointer: coarse) {\\n  .settingspanel .contents .options .option .item .api-key-help a:hover {\\n    text-decoration: underline;\\n    opacity: 0.8;\\n  }\\n}\\n.settingspanel .contents .options .option .item .input {\\n  display: flex;\\n  flex-direction: column;\\n  align-items: flex-start;\\n  min-width: 300px;\\n  flex-shrink: 0;\\n  gap: 5px;\\n}\\n.settingspanel .contents .options .option .item .input input {\\n  border: 1px solid #444;\\n  background-color: #2a2a2a;\\n  color: #fff;\\n  padding: 8px 12px;\\n  border-radius: 6px;\\n  width: 300px;\\n  font-size: 14px;\\n  transition: all 0.2s ease;\\n}\\n.settingspanel .contents .options .option .item .input input:focus {\\n  outline: none;\\n  border-color: #00b4d8;\\n  box-shadow: 0 0 0 2px rgba(0, 180, 216, 0.2);\\n}\\n.settingspanel .contents .options .option .item .input input[type=number] {\\n  width: 100px;\\n}\\n.settingspanel .contents .options .option .item .button {\\n  border: 1px solid #444;\\n  background-color: #2a2a2a;\\n  margin: 0 5px;\\n  padding: 8px 12px;\\n  border-radius: 6px;\\n  cursor: pointer;\\n  color: #fff;\\n  transition: all 0.2s ease;\\n}\\n@media not all and (pointer: coarse) {\\n  .settingspanel .contents .options .option .item .button:hover {\\n    background-color: #333;\\n    border-color: #555;\\n  }\\n}\\n.settingspanel .switch {\\n  position: relative;\\n  display: inline-block;\\n  width: 50px;\\n  height: 24px;\\n}\\n.settingspanel .switch input {\\n  opacity: 0;\\n  width: 0;\\n  height: 0;\\n}\\n.settingspanel .switch .slider {\\n  position: absolute;\\n  cursor: pointer;\\n  top: 0;\\n  left: 0;\\n  right: 0;\\n  bottom: 0;\\n  background-color: #444;\\n  transition: 0.3s;\\n  border-radius: 24px;\\n}\\n.settingspanel .switch .slider:before {\\n  position: absolute;\\n  content: \\\"\\\";\\n  height: 18px;\\n  width: 18px;\\n  left: 3px;\\n  bottom: 3px;\\n  background-color: white;\\n  transition: 0.3s;\\n  border-radius: 50%;\\n}\\n.settingspanel .switch input:checked + .slider {\\n  background-color: #00b4d8;\\n}\\n.settingspanel .switch input:focus + .slider {\\n  box-shadow: 0 0 1px #00b4d8;\\n}\\n.settingspanel .switch input:checked + .slider:before {\\n  transform: translateX(26px);\\n}\\n.settingspanel .switch.round .slider {\\n  border-radius: 24px;\\n}\\n.settingspanel .switch.round .slider:before {\\n  border-radius: 50%;\\n}\\n\\n@media (max-width: 800px) {\\n  .settingspanel {\\n    width: 90vw;\\n    height: 80vh;\\n    max-width: 600px;\\n    max-height: 500px;\\n  }\\n  .contents {\\n    grid-template-columns: 150px 1fr;\\n  }\\n  .options {\\n    padding: 20px;\\n  }\\n  .item {\\n    flex-direction: column;\\n    align-items: flex-start;\\n    gap: 10px;\\n  }\\n  .item .input {\\n    align-items: flex-start;\\n    width: 100%;\\n  }\\n  .item .input input {\\n    width: 100%;\\n    max-width: 300px;\\n  }\\n}</style>\\n\"],\"names\":[],\"mappings\":\"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\"}"
 };
 
 const Settings = create_ssr_component(($$result, $$props, $$bindings, slots) => {
-	let $portraitLandscape, $$unsubscribe_portraitLandscape;
-	let $imageVideo, $$unsubscribe_imageVideo;
-	let $muted, $$unsubscribe_muted;
+	let $apiKey, $$unsubscribe_apiKey;
+	let $hideUIonStart, $$unsubscribe_hideUIonStart;
+	let $$unsubscribe_portraitLandscape;
+	let $$unsubscribe_imageVideo;
+	let $$unsubscribe_muted;
 	let $numCols, $$unsubscribe_numCols;
 	let $prefetchNum, $$unsubscribe_prefetchNum;
-	let $prefetch, $$unsubscribe_prefetch;
-	let $oldreddit, $$unsubscribe_oldreddit;
-	let $lores, $$unsubscribe_lores;
-	let $hires, $$unsubscribe_hires;
+	let $$unsubscribe_prefetch;
+	let $$unsubscribe_oldreddit;
+	let $$unsubscribe_lores;
+	let $$unsubscribe_hires;
 	let $scrollspeed, $$unsubscribe_scrollspeed;
 	let $autoplayinterval, $$unsubscribe_autoplayinterval;
-	$$unsubscribe_portraitLandscape = subscribe(portraitLandscape, value => $portraitLandscape = value);
-	$$unsubscribe_imageVideo = subscribe(imageVideo, value => $imageVideo = value);
-	$$unsubscribe_muted = subscribe(muted, value => $muted = value);
+	$$unsubscribe_apiKey = subscribe(apiKey, value => $apiKey = value);
+	$$unsubscribe_hideUIonStart = subscribe(hideUIonStart, value => $hideUIonStart = value);
+	$$unsubscribe_portraitLandscape = subscribe(portraitLandscape, value => value);
+	$$unsubscribe_imageVideo = subscribe(imageVideo, value => value);
+	$$unsubscribe_muted = subscribe(muted, value => value);
 	$$unsubscribe_numCols = subscribe(numCols, value => $numCols = value);
 	$$unsubscribe_prefetchNum = subscribe(prefetchNum, value => $prefetchNum = value);
-	$$unsubscribe_prefetch = subscribe(prefetch, value => $prefetch = value);
-	$$unsubscribe_oldreddit = subscribe(oldreddit, value => $oldreddit = value);
-	$$unsubscribe_lores = subscribe(lores, value => $lores = value);
-	$$unsubscribe_hires = subscribe(hires, value => $hires = value);
+	$$unsubscribe_prefetch = subscribe(prefetch, value => value);
+	$$unsubscribe_oldreddit = subscribe(oldreddit, value => value);
+	$$unsubscribe_lores = subscribe(lores, value => value);
+	$$unsubscribe_hires = subscribe(hires, value => value);
 	$$unsubscribe_scrollspeed = subscribe(scrollspeed, value => $scrollspeed = value);
 	$$unsubscribe_autoplayinterval = subscribe(autoplayinterval, value => $autoplayinterval = value);
+	const dispatch = createEventDispatcher();
 	let { showSettings } = $$props;
 	autoplayinterval.useLocalStorage(3);
 	scrollspeed.useLocalStorage(2);
@@ -1123,22 +1219,31 @@ const Settings = create_ssr_component(($$result, $$props, $$bindings, slots) => 
 	imageVideo.useLocalStorage(0);
 	portraitLandscape.useLocalStorage(0);
 	muted.useLocalStorage(true);
+	hideUIonStart.useLocalStorage(true);
+	apiKey.useLocalStorage('');
 	let _autoplayinterval = $autoplayinterval;
 	let _scrollspeed = $scrollspeed;
-	let _hires = $hires;
-	let _lores = $lores;
-	let _oldreddit = $oldreddit;
-	let _prefetch = $prefetch;
 	let _prefetchNum = $prefetchNum;
 	let _numCols = $numCols;
-	let _muted = $muted;
-	let _imageVideo = $imageVideo;
-	let _portraitLandscape = $portraitLandscape;
-	let imagesVideoStates = ["Both images and videos", "Videos only", "Images only"];
-	let portraitLandscapeStates = ["Both landscape and portrait", "Portrait only", "Landscape only"];
+	let _hideUIonStart = $hideUIonStart;
+	let _apiKey = $apiKey;
 
 	if ($$props.showSettings === void 0 && $$bindings.showSettings && showSettings !== void 0) $$bindings.showSettings(showSettings);
 	$$result.css.add(css$4);
+
+	{
+		hideUIonStart.set(_hideUIonStart);
+	}
+
+	{
+		{
+			apiKey.set(_apiKey);
+
+			if (_apiKey) {
+				dispatch('apiKeyChange', _apiKey);
+			}
+		}
+	}
 
 	{
 		{
@@ -1170,6 +1275,8 @@ const Settings = create_ssr_component(($$result, $$props, $$bindings, slots) => 
 		}
 	}
 
+	$$unsubscribe_apiKey();
+	$$unsubscribe_hideUIonStart();
 	$$unsubscribe_portraitLandscape();
 	$$unsubscribe_imageVideo();
 	$$unsubscribe_muted();
@@ -1181,12 +1288,12 @@ const Settings = create_ssr_component(($$result, $$props, $$bindings, slots) => 
 	$$unsubscribe_hires();
 	$$unsubscribe_scrollspeed();
 	$$unsubscribe_autoplayinterval();
-	return `<div class="${["settingspanel svelte-abj757", showSettings ? "showSettings" : ""].join(' ').trim()}"><div class="${"head svelte-abj757"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faCog$1.faCog }, {}, {})}Settings</div><div class="${"close svelte-abj757"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faTimes$1.faTimes }, {}, {})}</div><div class="${"contents svelte-abj757"}"><div class="${"nav svelte-abj757"}"><div class="${["svelte-abj757", "active" ].join(' ').trim()}">General</div><div class="${["svelte-abj757", ""].join(' ').trim()}">Keybindings</div></div><div class="${"options svelte-abj757"}"><div class="${["option svelte-abj757", "active" ].join(' ').trim()}"><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Autoplay time (seconds)</span><span class="${"input"}"><input type="${"number"}" class="${"svelte-abj757"}"${add_attribute("value", _autoplayinterval, 0)}></span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Scroll speed (0-20)</span><span class="${"input"}"><input type="${"number"}" class="${"svelte-abj757"}"${add_attribute("value", _scrollspeed, 0)}></span></div><div class="${"item svelte-abj757"}"><span class="${"tooltip svelte-abj757"}" data-tooltip="${"Preload media in the background"}">Prefetch media</span><span><span class="${"button svelte-abj757"}">${escape(_prefetch ? "Prefetch is on" : "Prefetch is off")}</span></span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Prefetch items</span><span class="${"input"}"><input type="${"number"}" class="${"svelte-abj757"}"${add_attribute("value", _prefetchNum, 0)}></span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Number of columns in grid mode</span><span class="${"input"}"><input type="${"number"}" class="${"svelte-abj757"}"${add_attribute("value", _numCols, 0)}></span></div><div class="${"item svelte-abj757"}"><span class="${"tooltip svelte-abj757"}" data-tooltip="${"Sound on/off"}">Sound</span><span><span class="${"button svelte-abj757"}">${escape(_muted ? "Sound is off" : "Sound is on")}</span></span></div><div class="${"item svelte-abj757"}"><span class="${"text tooltip svelte-abj757"}" data-tooltip="${"Choose what type of image to display"}">Display image resolution</span><span><span class="${"button svelte-abj757"}">${escape(_hires ? "Original (slow)" : "Optimized (fast)")}</span></span></div><div class="${"item svelte-abj757"}"><span class="${"text tooltip svelte-abj757"}" data-tooltip="${"Choose what type of video to display"}">Display video resolution</span><span><span class="${"button svelte-abj757"}">${escape(_lores ? "Prefer lo-res (fast)" : "Original (slow)")}</span></span></div><div class="${"item svelte-abj757"}"><span class="${"text tooltip svelte-abj757"}" data-tooltip="${"Choose whether to go to reddit.com or old.reddit.com"}">reddit.com link handling</span><span><span class="${"button svelte-abj757"}">${escape(_oldreddit ? "old.reddit.com" : "reddit.com (New)")}</span></span></div><div class="${"item svelte-abj757"}"><span class="${"text tooltip svelte-abj757"}" data-tooltip="${"Choose whether to show videos only, images only or both"}">Display images/videos/both</span><span><span class="${"button svelte-abj757"}">${escape(imagesVideoStates[_imageVideo])}</span></span></div><div class="${"item svelte-abj757"}"><span class="${"text tooltip svelte-abj757"}" data-tooltip="${"Choose whether to show portrait only, landscape only or both"}">Display portrait/landscape/both</span><span><span class="${"button svelte-abj757"}">${escape(portraitLandscapeStates[_portraitLandscape])}</span></span></div></div><div class="${["option svelte-abj757", ""].join(' ').trim()}"><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Play / Pause</span><span class="${"key svelte-abj757"}">q</span><span class="${"key svelte-abj757"}">p</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Next item</span><span class="${"key svelte-abj757"}">Space</span><span class="${"key svelte-abj757"}">Right</span><span class="${"key svelte-abj757"}">d</span><span class="${"key svelte-abj757"}">j</span><span class="${"key svelte-abj757"}">Page-down</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Previous item</span><span class="${"key svelte-abj757"}">Left</span><span class="${"key svelte-abj757"}">a</span><span class="${"key svelte-abj757"}">k</span><span class="${"key svelte-abj757"}">Page-up</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Next item in the album</span><span class="${"key svelte-abj757"}">Up</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Previous item in the album</span><span class="${"key svelte-abj757"}">Down</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Hide UI / Controls</span><span class="${"key svelte-abj757"}">h</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Toggle favorite</span><span class="${"key svelte-abj757"}">x</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Toggle Sound</span><span class="${"key svelte-abj757"}">s</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Remove all favorites</span><span class="${"key svelte-abj757"}">Shift + x</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Remove all favorites (across all subreddits)</span><span class="${"key svelte-abj757"}">Ctrl + Shift + x</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Filter</span><span class="${"key svelte-abj757"}">/</span><span class="${"key svelte-abj757"}">f</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Open reddit (old.reddit.com)</span><span class="${"key svelte-abj757"}">o</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Open reddit</span><span class="${"key svelte-abj757"}">r</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Open high-res</span><span class="${"key svelte-abj757"}">i</span></div><div class="${"item svelte-abj757"}"><span class="${"text svelte-abj757"}">Add to multireddit</span><span class="${"key svelte-abj757"}">m</span></div></div></div></div></div>`;
+	return `<div class="${["settingspanel svelte-1sqtgrn", showSettings ? "showSettings" : ""].join(' ').trim()}"><div class="head svelte-1sqtgrn">${validate_component(Icon, "Icon").$$render($$result, { icon: faCog$1.faCog }, {}, {})}Settings</div><div class="close svelte-1sqtgrn">${validate_component(Icon, "Icon").$$render($$result, { icon: faTimes$1.faTimes }, {}, {})}</div><div class="contents svelte-1sqtgrn"><div class="nav svelte-1sqtgrn"><div class="${["svelte-1sqtgrn", "active" ].join(' ').trim()}">General</div><div class="${["svelte-1sqtgrn", ""].join(' ').trim()}">Keybindings</div></div><div class="options svelte-1sqtgrn"><div class="${["option svelte-1sqtgrn", "active" ].join(' ').trim()}"><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Autoplay Duration (seconds)</span><span class="input svelte-1sqtgrn"><input type="number" min="0" max="60" class="svelte-1sqtgrn"${add_attribute("value", _autoplayinterval, 0)}></span></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Scroll Speed (0-20)</span><span class="input svelte-1sqtgrn"><input type="number" min="0" max="20" class="svelte-1sqtgrn"${add_attribute("value", _scrollspeed, 0)}></span></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Prefetch Count</span><span class="input svelte-1sqtgrn"><input type="number" min="1" max="200" class="svelte-1sqtgrn"${add_attribute("value", _prefetchNum, 0)}></span></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Hide UI on Startup</span><label class="switch svelte-1sqtgrn"><input type="checkbox" class="svelte-1sqtgrn"${add_attribute("checked", _hideUIonStart, 1)}><span class="slider round svelte-1sqtgrn"></span></label></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Tumblr API Key</span><span class="input svelte-1sqtgrn"><input type="text" placeholder="Enter your OAuth Consumer Key" class="svelte-1sqtgrn"${add_attribute("value", _apiKey, 0)}></span><div class="api-key-help svelte-1sqtgrn"><a href="https://www.tumblr.com/oauth/apps" target="_blank" class="svelte-1sqtgrn">Get API Key Here</a></div></div></div><div class="${["option svelte-1sqtgrn", ""].join(' ').trim()}"><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Play / Pause</span><span class="key svelte-1sqtgrn">q</span><span class="key svelte-1sqtgrn">p</span></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Next Item</span><span class="key svelte-1sqtgrn">Space</span><span class="key svelte-1sqtgrn">Right</span><span class="key svelte-1sqtgrn">d</span><span class="key svelte-1sqtgrn">j</span><span class="key svelte-1sqtgrn">Page-down</span></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Previous Item</span><span class="key svelte-1sqtgrn">Left</span><span class="key svelte-1sqtgrn">a</span><span class="key svelte-1sqtgrn">k</span><span class="key svelte-1sqtgrn">Page-up</span></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Next Album Item</span><span class="key svelte-1sqtgrn">Up</span></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Previous Album Item</span><span class="key svelte-1sqtgrn">Down</span></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Toggle UI</span><span class="key svelte-1sqtgrn">h</span></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Toggle Sound</span><span class="key svelte-1sqtgrn">s</span></div><div class="item svelte-1sqtgrn"><span class="text svelte-1sqtgrn">Open on Tumblr</span><span class="key svelte-1sqtgrn">o</span></div></div></div></div></div>`;
 });
 
 const CONTEXT_KEY = {};
 
-/* src/routes/_layout.svelte generated by Svelte v3.46.2 */
+/* src/routes/_layout.svelte generated by Svelte v3.59.2 */
 
 const Layout = create_ssr_component(($$result, $$props, $$bindings, slots) => {
 	return `${slots.default ? slots.default({}) : ``}`;
@@ -1197,7 +1304,7 @@ var root_comp = /*#__PURE__*/Object.freeze({
     'default': Layout
 });
 
-/* src/node_modules/@sapper/internal/error.svelte generated by Svelte v3.46.2 */
+/* src/node_modules/@sapper/internal/error.svelte generated by Svelte v3.59.2 */
 
 const Error$1 = create_ssr_component(($$result, $$props, $$bindings, slots) => {
 	let { error } = $$props;
@@ -1212,7 +1319,7 @@ const Error$1 = create_ssr_component(($$result, $$props, $$bindings, slots) => {
 ${``}`;
 });
 
-/* src/node_modules/@sapper/internal/App.svelte generated by Svelte v3.46.2 */
+/* src/node_modules/@sapper/internal/App.svelte generated by Svelte v3.59.2 */
 
 const App = create_ssr_component(($$result, $$props, $$bindings, slots) => {
 	let { stores } = $$props;
@@ -1235,11 +1342,11 @@ const App = create_ssr_component(($$result, $$props, $$bindings, slots) => {
 	return `
 
 
-${validate_component(Layout, "Layout").$$render($$result, Object.assign({ segment: segments[0] }, level0.props), {}, {
+${validate_component(Layout, "Layout").$$render($$result, Object.assign({}, { segment: segments[0] }, level0.props), {}, {
 		default: () => {
 			return `${error
 			? `${validate_component(Error$1, "Error").$$render($$result, { error, status }, {}, {})}`
-			: `${validate_component(level1.component || missing_component, "svelte:component").$$render($$result, Object.assign(level1.props), {}, {})}`}`;
+			: `${validate_component(level1.component || missing_component, "svelte:component").$$render($$result, Object.assign({}, level1.props), {}, {})}`}`;
 		}
 	})}`;
 });
@@ -1323,27 +1430,34 @@ async function format_tumblr_post(post) {
     let url = post.post_url;
     if (post.type === "photo" && post.photos && post.photos.length > 0) {
         is_image = true;
-        const originalPhoto = post.photos[0].original_size;
+        const best_photos = post.photos.map(photo => {
+            let all_sizes = [...photo.alt_sizes];
+            if (photo.original_size) {
+                all_sizes.push(photo.original_size);
+            }
+            return all_sizes.reduce((prev, current) => (prev.width > current.width) ? prev : current);
+        });
+        const best_photo = best_photos[0];
         imgs = {
-            default: originalPhoto.url,
-            hires: originalPhoto.url,
-            album: post.photos.map(photo => ({
-                default: photo.original_size.url,
-                hires: photo.original_size.url,
+            default: best_photo.url,
+            hires: best_photo.url,
+            album: best_photos.map(p => ({
+                default: p.url,
+                hires: p.url,
                 is_image: true,
                 is_video: false,
                 preview: {
                     vid: {},
                     img: {
-                        hires: photo.original_size.url,
-                        default: photo.original_size.url,
+                        hires: p.url,
+                        default: p.url,
                         album: [],
                     },
                 },
             })),
         };
-        dims = { width: originalPhoto.width, height: originalPhoto.height };
-        url = originalPhoto.url;
+        dims = { width: best_photo.width, height: best_photo.height };
+        url = best_photo.url;
     }
     else if (post.type === "video" && post.video_url) {
         is_video = true;
@@ -1360,6 +1474,47 @@ async function format_tumblr_post(post) {
         }
         url = post.video_url;
     }
+    else if (post.type === "text" && post.body) {
+        const imgRegex = /<img[^>]+src="([^">]+)"/g;
+        const foundImages = [];
+        let match;
+        while ((match = imgRegex.exec(post.body)) !== null) {
+            foundImages.push(match[1]);
+        }
+        if (foundImages.length > 0) {
+            is_image = true;
+            const getHiResUrl = (url) => url.replace(/_\d{3,}\.(jpg|png|gif|webp)$/, '_1280.$1').replace(/\/s\d+x\d+\//, '/');
+            const hiresImages = foundImages.map(getHiResUrl);
+            imgs = {
+                default: foundImages[0],
+                hires: hiresImages[0],
+                album: foundImages.map((imgUrl, i) => ({
+                    default: imgUrl,
+                    hires: hiresImages[i],
+                    is_image: true,
+                    is_video: false,
+                    preview: {
+                        vid: {},
+                        img: {
+                            hires: hiresImages[i],
+                            default: imgUrl,
+                            album: [],
+                        },
+                    },
+                })),
+            };
+            // For now, we can't easily get dimensions from the body.
+            dims = { width: 0, height: 0 };
+            url = foundImages[0];
+        }
+        else {
+            console.log(`[format_tumblr_post] Text post with no images. ID: ${post.id}`);
+        }
+    }
+    else {
+        // Log posts that are not identified as image or video
+        console.log(`[format_tumblr_post] Post not identified as image/video. Type: ${post.type}, Post:`, post);
+    }
     let orientation = Orientation.Normal;
     if (dims.width && dims.height) {
         if ((dims.width / dims.height) <= 0.7) {
@@ -1369,6 +1524,8 @@ async function format_tumblr_post(post) {
             orientation = Orientation.Landscape;
         }
     }
+    const nsfw_tags = ["nsfw", "adult", "mature", "18+", "explicit"];
+    const is_nsfw = post.tags.some(tag => nsfw_tags.includes(tag.toLowerCase()));
     return {
         id: String(post.id),
         author: post.blog_name,
@@ -1378,7 +1535,7 @@ async function format_tumblr_post(post) {
         subreddit: post.blog_name,
         subredditp: `t/${post.blog_name}`,
         permalink: post.post_url,
-        over18: false,
+        over18: is_nsfw,
         is_video: is_video,
         is_image: is_image,
         is_album: is_image && imgs.album && imgs.album.length > 1,
@@ -1391,6 +1548,16 @@ async function format_tumblr_post(post) {
 }
 async function get_tumblr_posts(url) {
     try {
+        console.log("[get_tumblr_posts] API URL:", url);
+        // Check if the URL contains the placeholder API key
+        if (url.includes('OAuth Consumer Key Goes Here')) {
+            console.log("[get_tumblr_posts]: Invalid API key detected");
+            return {
+                posts: [],
+                after: null,
+                res: { ok: false, res: "Invalid API key. Please set your Tumblr API key in settings." },
+            };
+        }
         const res = await fetch(url);
         console.log("[get_tumblr_posts] Raw Response Object:", res);
         const data = await res.json();
@@ -1404,19 +1571,27 @@ async function get_tumblr_posts(url) {
                 res: { ok: false, res: data.meta.msg },
             };
         }
-        const rawPosts = data.response.posts;
-        console.log("[get_tumblr_posts] Raw Posts Array:", rawPosts);
-        rawPosts.forEach(post => console.log("[get_tumblr_posts] Post Type:", post.type));
+        const rawPosts = data.response.posts || data.response;
+        console.log("[get_tumblr_posts] Raw Posts Array (before filtering):", rawPosts);
+        rawPosts.forEach(post => console.log(`[get_tumblr_posts] Post Type: ${post.type}, ID: ${post.id}`));
         const formattedPosts = await Promise.all(rawPosts.map(post => format_tumblr_post(post)));
         // Filter for only image and video posts for now, similar to redditpx
         const filteredPosts = formattedPosts.filter((post) => post.is_image || post.is_video);
-        // Tumblr API uses 'offset' for pagination, not 'after'.
-        // We'll return the next offset based on the number of posts returned.
-        // This assumes the API returns a 'limit' number of posts per request.
-        const nextOffset = data.response.posts.length > 0 ? (parseInt(url.match(/offset=(\d+)/)?.[1] || "0") + data.response.posts.length) : null;
+        let after_value;
+        if (url.includes('/tagged')) {
+            if (rawPosts.length > 0) {
+                after_value = rawPosts[rawPosts.length - 1].timestamp;
+            }
+            else {
+                after_value = null;
+            }
+        }
+        else {
+            after_value = rawPosts.length > 0 ? (parseInt(url.match(/offset=(\d+)/)?.[1] || "0") + rawPosts.length) : null;
+        }
         return {
             posts: filteredPosts,
-            after: nextOffset,
+            after: after_value,
             res: { ok: true, res },
         };
     }
@@ -2082,11 +2257,11 @@ function startWith(value) {
 
 }
 
-/* src/components/FullscreenLayout.svelte generated by Svelte v3.46.2 */
+/* src/components/FullscreenLayout.svelte generated by Svelte v3.59.2 */
 
 const css$3 = {
-	code: ".hide-cursor.svelte-1a8m49b.svelte-1a8m49b{cursor:none}.hide.svelte-1a8m49b.svelte-1a8m49b{display:none !important}.wrapper.svelte-1a8m49b.svelte-1a8m49b{height:100vh;display:grid;justify-items:center;align-items:center}.wrapper.svelte-1a8m49b .hero.svelte-1a8m49b{height:100vh;width:100vw;display:flex;flex-direction:column;justify-content:space-between;align-items:center}.wrapper.svelte-1a8m49b .hero .title.svelte-1a8m49b{z-index:10;position:absolute;left:1rem;top:0;background-color:rgba(0, 0, 0, 0.4);color:#fafafa;font-size:1.5rem;max-width:77%;padding:1rem;border-radius:3px}.wrapper.svelte-1a8m49b .hero .settings.svelte-1a8m49b{z-index:10;position:absolute;top:0;right:0;color:#fafafa;font-size:1rem;padding:1.5rem 2rem}.wrapper.svelte-1a8m49b .hero .main-media-container.svelte-1a8m49b{flex-grow:1;display:flex;justify-content:center;align-items:center;width:100%;height:100%}.wrapper.svelte-1a8m49b .hero .main-media-container img.svelte-1a8m49b,.wrapper.svelte-1a8m49b .hero .main-media-container video.svelte-1a8m49b{max-width:100%;max-height:100%;object-fit:contain}.wrapper.svelte-1a8m49b .hero .goto.svelte-1a8m49b{user-select:none;z-index:5;position:absolute;background-color:rgba(0, 0, 0, 0.6);bottom:0;display:grid;grid-row-gap:5px;padding:1rem 11rem;border-radius:3px;color:#fafafa;width:100%;grid-template-columns:repeat(auto-fill, minmax(32px, 1fr))}.wrapper.svelte-1a8m49b .hero .goto.tinygoto.svelte-1a8m49b{grid-template-rows:auto 1fr;grid-template-columns:1fr}.wrapper.svelte-1a8m49b .hero .goto.tinygoto .btnwrapper.svelte-1a8m49b{grid-template-columns:repeat(auto-fill, minmax(32px, 1fr));display:grid}.wrapper.svelte-1a8m49b .hero .goto.tinygoto .numswrapper.svelte-1a8m49b{grid-template-columns:repeat(auto-fit, minmax(1rem, auto));grid-auto-columns:max-content;display:grid;grid-gap:0.2rem}.wrapper.svelte-1a8m49b .hero .goto.tinygoto .numswrapper .nums.svelte-1a8m49b{border-bottom:3px solid rgba(255, 255, 255, 0.3);height:1rem;cursor:pointer}@media not all and (pointer: coarse){.wrapper.svelte-1a8m49b .hero .goto.tinygoto .numswrapper .nums.svelte-1a8m49b:hover{border-bottom:3px solid white !important}}.wrapper.svelte-1a8m49b .hero .goto.tinygoto .numswrapper .nums.currnum.svelte-1a8m49b{border-bottom:3px solid white !important}.wrapper.svelte-1a8m49b .hero .goto.tinygoto .numswrapper .nums.currnum.album.svelte-1a8m49b{border-bottom:3px dotted white !important}.wrapper.svelte-1a8m49b .hero .goto.tinygoto .numswrapper .nums.favorite.svelte-1a8m49b{border-bottom:3px solid #fbbc04}.wrapper.svelte-1a8m49b .hero .goto.tinygoto .numswrapper .nums.over18.svelte-1a8m49b{border-bottom:3px solid #ea4335}.wrapper.svelte-1a8m49b .hero .goto.tinygoto .numswrapper p.svelte-1a8m49b{display:none}.wrapper.svelte-1a8m49b .hero .goto.tinygoto .numswrapper .reload.svelte-1a8m49b{grid-column:span 2}.wrapper.svelte-1a8m49b .hero .goto .btnwrapper.svelte-1a8m49b,.wrapper.svelte-1a8m49b .hero .goto .numswrapper.svelte-1a8m49b{display:contents}.wrapper.svelte-1a8m49b .hero .goto .btnwrapper .reload.svelte-1a8m49b{bottom:-1px}.wrapper.svelte-1a8m49b .hero .goto .numswrapper .displayinfo.svelte-1a8m49b{grid-column:span 1;font-size:0.8rem;margin-top:2px}.wrapper.svelte-1a8m49b .hero .goto .numswrapper .displayinfo p.svelte-1a8m49b{margin:0;text-align:center}.wrapper.svelte-1a8m49b .hero .goto .btn.svelte-1a8m49b{text-align:center;padding-top:2px;color:rgba(255, 255, 255, 0.3)}.wrapper.svelte-1a8m49b .hero .goto .btn.reload.svelte-1a8m49b{cursor:pointer}.wrapper.svelte-1a8m49b .hero .goto .btn.reload.loaderror.svelte-1a8m49b{color:#ea4335}@media not all and (pointer: coarse){.wrapper.svelte-1a8m49b .hero .goto .btn.reload.svelte-1a8m49b:hover{color:white}}.wrapper.svelte-1a8m49b .hero .goto .btn.deepsearch.svelte-1a8m49b{grid-column:span 4;bottom:2px;cursor:pointer;justify-self:center}.wrapper.svelte-1a8m49b .hero .goto .btn.deepsearch:hover p.svelte-1a8m49b{color:white;border:1px solid white}.wrapper.svelte-1a8m49b .hero .goto .btn.deepsearch p.svelte-1a8m49b{margin:0;font-size:0.9rem;color:#b3b3b3;border:1px solid #b3b3b3;border-radius:3px;padding:0 1rem}.wrapper.svelte-1a8m49b .hero .goto .btn.over18wrapper.svelte-1a8m49b{cursor:pointer;grid-column:span 2;justify-self:center}.wrapper.svelte-1a8m49b .hero .goto .btn.over18wrapper.over18 p.svelte-1a8m49b{border:1px solid rgba(255, 255, 255, 0.3);color:rgba(255, 255, 255, 0.3)}@media not all and (pointer: coarse){.wrapper.svelte-1a8m49b .hero .goto .btn.over18wrapper.over18 p.svelte-1a8m49b:hover{border:1px solid rgba(255, 255, 255, 0.6);color:rgba(255, 255, 255, 0.6)}}.wrapper.svelte-1a8m49b .hero .goto .btn.over18wrapper p.svelte-1a8m49b{font-size:0.9rem;border:1px solid #ea4335;border-radius:3px;color:#ea4335;margin:0;width:58px;font-family:\"Roboto Condensed\", sans-serif;position:relative;top:-1px}.wrapper.svelte-1a8m49b .hero .goto .btn.imagevideo.svelte-1a8m49b{cursor:pointer;font-size:1.4rem;bottom:2px;color:white}.wrapper.svelte-1a8m49b .hero .goto .btn.muted.svelte-1a8m49b{cursor:pointer;font-size:1.4rem;bottom:2px;color:white}.wrapper.svelte-1a8m49b .hero .goto .btn.portraitlandscape.svelte-1a8m49b{cursor:pointer;font-size:1.4rem;bottom:2px;color:white}.wrapper.svelte-1a8m49b .hero .goto .btn.portraitlandscape.svelte-1a8m49b .landscape{transform:rotate(270deg)}.wrapper.svelte-1a8m49b .hero .goto .btn.dice.svelte-1a8m49b{cursor:pointer;font-size:1.4rem;bottom:2px;color:white}.wrapper.svelte-1a8m49b .hero .goto .btn.download.svelte-1a8m49b{cursor:default;font-size:1.4rem;bottom:2px}.wrapper.svelte-1a8m49b .hero .goto .btn.download.dlready.svelte-1a8m49b{color:rgba(251, 188, 4, 0.9);cursor:pointer}@media not all and (pointer: coarse){.wrapper.svelte-1a8m49b .hero .goto .btn.download.dlready.svelte-1a8m49b:hover{color:#f9ab00}}.wrapper.svelte-1a8m49b .hero .goto .btn.playpause.svelte-1a8m49b{cursor:pointer;top:1px}.wrapper.svelte-1a8m49b .hero .goto .btn.playpause.play.svelte-1a8m49b{color:white}@media not all and (pointer: coarse){.wrapper.svelte-1a8m49b .hero .goto .btn.playpause.svelte-1a8m49b:hover{color:white}}.wrapper.svelte-1a8m49b .hero .goto .btn.filter.svelte-1a8m49b{cursor:pointer;top:1px}@media not all and (pointer: coarse){.wrapper.svelte-1a8m49b .hero .goto .btn.filter.svelte-1a8m49b:hover{color:white}}.wrapper.svelte-1a8m49b .hero .goto .btn.filter.filter.filterExpanded.svelte-1a8m49b{grid-column:span 3;top:-2px}.wrapper.svelte-1a8m49b .hero .goto .btn.filter.filter.filterExpanded input.svelte-1a8m49b{width:85%;margin-left:0px;padding-left:5px;padding-right:5px;border:1px solid rgba(255, 255, 255, 0.6);background-color:rgba(0, 0, 0, 0);color:white}.wrapper.svelte-1a8m49b .hero .goto span.svelte-1a8m49b{position:relative}.wrapper.svelte-1a8m49b .hero .goto span.favorite p.small.svelte-1a8m49b{border-bottom:3px solid #e37400 !important;color:#fbbc04}.wrapper.svelte-1a8m49b .hero .goto span.favorite img.small.svelte-1a8m49b{border-color:#e37400 !important}.wrapper.svelte-1a8m49b .hero .goto span.over18 p.small.svelte-1a8m49b{color:#ea4335;border-bottom:3px solid #ea4335}.wrapper.svelte-1a8m49b .hero .goto span.over18 img.small.svelte-1a8m49b{border-color:#ea4335}.wrapper.svelte-1a8m49b .hero .goto span p.small.svelte-1a8m49b{margin:0 2px;text-align:center;cursor:pointer;border-bottom:3px solid rgba(0, 0, 0, 0)}.wrapper.svelte-1a8m49b .hero .goto span p.small.curr.svelte-1a8m49b{background-color:rgba(255, 255, 255, 0.2);border-bottom:3px solid white !important}.wrapper.svelte-1a8m49b .hero .goto span p.small.curr.album.svelte-1a8m49b{border-bottom:3px dashed white !important}.wrapper.svelte-1a8m49b .hero .goto span img.small.svelte-1a8m49b{z-index:10;width:0px;opacity:0;position:absolute;bottom:35px;border:2px solid white;background-color:#4d4d4d;min-width:100px;pointer-events:none;object-fit:cover}.wrapper.svelte-1a8m49b .hero .goto span:hover p.small.svelte-1a8m49b{background-color:rgba(255, 255, 255, 0.1);border-bottom:3px solid white !important}.wrapper.svelte-1a8m49b .hero .goto span:hover img.svelte-1a8m49b{width:auto;height:100px;opacity:1}.wrapper.svelte-1a8m49b .hero .video.svelte-1a8m49b{height:100vh;width:100vw;object-fit:contain}@media(max-width: 1000px){.wrapper.svelte-1a8m49b .hero .goto.svelte-1a8m49b{padding:1rem 11rem 1rem 1rem}}@media(max-width: 800px){.wrapper.svelte-1a8m49b .hero .goto.svelte-1a8m49b{padding:1rem}.wrapper.svelte-1a8m49b .hero .goto.tinygoto .nums.svelte-1a8m49b{height:0.1rem !important}.wrapper.svelte-1a8m49b .hero .goto img.small.svelte-1a8m49b{display:none}}.tooltip.svelte-1a8m49b.svelte-1a8m49b{position:relative;z-index:2;cursor:pointer}.tooltip.bottom.svelte-1a8m49b.svelte-1a8m49b:before,.tooltip.svelte-1a8m49b.svelte-1a8m49b:before{position:absolute;bottom:120%;left:50%;margin-bottom:5px;margin-left:-30px;padding:5px 4px;width:max-content;border-radius:3px;background-color:black;color:#fff;background-color:rgba(255, 255, 255, 0.9);color:black;content:attr(data-tooltip);text-align:center;font-size:0.8rem;line-height:1.2}.tooltip.bottom.svelte-1a8m49b.svelte-1a8m49b:after,.tooltip.svelte-1a8m49b.svelte-1a8m49b:after{position:absolute;bottom:120%;left:50%;margin-left:-5px;width:0;border-top:5px solid rgba(255, 255, 255, 0.9);border-right:5px solid transparent;border-left:5px solid transparent;content:\" \";font-size:0;line-height:0}.tooltip.svelte-1a8m49b.svelte-1a8m49b:before,.tooltip.svelte-1a8m49b.svelte-1a8m49b:after{visibility:hidden;opacity:0;pointer-events:none}.tooltip.bottom.svelte-1a8m49b.svelte-1a8m49b:before{bottom:-170%}.tooltip.bottom.svelte-1a8m49b.svelte-1a8m49b:after{bottom:-40%;border-bottom:5px solid rgba(255, 255, 255, 0.9);border-top:5px solid transparent}.tooltip.svelte-1a8m49b.svelte-1a8m49b:hover:before,.tooltip.svelte-1a8m49b.svelte-1a8m49b:hover:after{visibility:visible;opacity:1}",
-	map: "{\"version\":3,\"file\":\"FullscreenLayout.svelte\",\"sources\":[\"FullscreenLayout.svelte\"],\"sourcesContent\":[\"<script>\\n  import Icon from \\\"fa-svelte/src/Icon.svelte\\\";\\n  import { faVolumeUp as faSoundOn } from \\\"@fortawesome/free-solid-svg-icons/faVolumeUp\\\";\\n  import { faVolumeMute as faSoundOff } from \\\"@fortawesome/free-solid-svg-icons/faVolumeMute\\\";\\n  import { faPlay } from \\\"@fortawesome/free-solid-svg-icons/faPlay\\\";\\n  import { faPause } from \\\"@fortawesome/free-solid-svg-icons/faPause\\\";\\n  import { faCog as faSettings } from \\\"@fortawesome/free-solid-svg-icons/faCog\\\";\\n  import { faHome } from \\\"@fortawesome/free-solid-svg-icons/faHome\\\";\\n  import { faDonate } from \\\"@fortawesome/free-solid-svg-icons/faDonate\\\";\\n  import { faExpandAlt as faExpand } from \\\"@fortawesome/free-solid-svg-icons/faExpandAlt\\\";\\n  import { faCloudDownloadAlt as faDownload } from \\\"@fortawesome/free-solid-svg-icons/faCloudDownloadAlt\\\";\\n  import { faDice } from \\\"@fortawesome/free-solid-svg-icons/faDice\\\";\\n  import { faPhotoVideo as faImageVideo } from \\\"@fortawesome/free-solid-svg-icons/faPhotoVideo\\\";\\n  import { faImage } from \\\"@fortawesome/free-solid-svg-icons/faImage\\\";\\n  import { faVideo } from \\\"@fortawesome/free-solid-svg-icons/faVideo\\\";\\n  import { faStar as faFav } from \\\"@fortawesome/free-solid-svg-icons/faStar\\\";\\n  import { faStar as faUnFav } from \\\"@fortawesome/free-regular-svg-icons/faStar\\\";\\n  import { faSearch } from \\\"@fortawesome/free-solid-svg-icons/faSearch\\\";\\n  import { faSync } from \\\"@fortawesome/free-solid-svg-icons/faSync\\\";\\n  import { faSpinner } from \\\"@fortawesome/free-solid-svg-icons/faSpinner\\\";\\n  import { faPlusCircle } from \\\"@fortawesome/free-solid-svg-icons/faPlusCircle\\\";\\n  import { faMinusCircle } from \\\"@fortawesome/free-solid-svg-icons/faMinusCircle\\\";\\n  import { faEye as faShow } from \\\"@fortawesome/free-solid-svg-icons/faEye\\\";\\n  import { faEyeSlash as faHide } from \\\"@fortawesome/free-solid-svg-icons/faEyeSlash\\\";\\n  import { faTh as faColumns } from \\\"@fortawesome/free-solid-svg-icons/faTh\\\";\\n  import { faExpandArrowsAlt as faFullscreen } from \\\"@fortawesome/free-solid-svg-icons/faExpandArrowsAlt\\\";\\n\\n  import { faMobileAlt as faPortrait } from \\\"@fortawesome/free-solid-svg-icons/faMobileAlt\\\";\\n  import { faDesktop as faLandscape } from \\\"@fortawesome/free-solid-svg-icons/faDesktop\\\";\\n\\n  import AutoComplete from \\\"simple-svelte-autocomplete\\\";\\n\\n  import Settings from \\\"./Settings.svelte\\\";\\n\\n  import { onMount, tick } from \\\"svelte\\\";\\n  import { goto as ahref } from \\\"@sapper/app\\\";\\n\\n  import shuffle from \\\"lodash.shuffle\\\";\\n\\n  import { get_tumblr_posts, queryp } from \\\"../_tumblr_utils.ts\\\";\\n\\n  \\n\\n  import { writable, throttle, startWith } from \\\"svelte-pipeable-store\\\";\\n\\n  import {\\n    autoplay,\\n    autoplayinterval,\\n    imageVideo,\\n    portraitLandscape,\\n    favorite,\\n    over18,\\n    prefetch,\\n    prefetchNum,\\n    hires,\\n    lores,\\n    muted,\\n    layout,\\n    multireddit,\\n    oldreddit\\n  } from \\\"../_prefs\\\";\\n  autoplay.useLocalStorage(false);\\n  autoplayinterval.useLocalStorage(3);\\n  imageVideo.useLocalStorage(0);\\n  portraitLandscape.useLocalStorage(0);\\n  favorite.useLocalStorage({});\\n  over18.useLocalStorage(1);\\n  multireddit.useLocalStorage({});\\n  prefetch.useLocalStorage(true);\\n  prefetchNum.useLocalStorage(50);\\n  hires.useLocalStorage(false);\\n  lores.useLocalStorage(true);\\n  oldreddit.useLocalStorage(false);\\n  muted.useLocalStorage(true);\\n  layout.useLocalStorage(0);\\n\\n  export let params, slugstr;\\n  export let posts;\\n  export let after;\\n  export let res;\\n  export let mode = \\\"tumblr\\\";\\n\\n  console.log(\\\"Posts from API:\\\", posts);\\n\\n  let data;\\n  let displayposts = [];\\n  console.log(\\\"Display Posts (initial):\\\", displayposts);\\n  let uiVisible = false;\\n  let hideCursor = true;\\n  let hideCursorTimerId = 0;\\n  let titleVisible = true;\\n  let numFavorite;\\n  let tinygoto;\\n  let title;\\n  let albumindex = 0;\\n\\n  $: {\\n    if (currpost.is_album) {\\n      title = `(${albumindex + 1}/${currpost.preview.img.album.length}) ${\\n        currpost.title\\n      }`;\\n    } else {\\n      title = currpost.title;\\n    }\\n  }\\n\\n  let blogIdentifier;\\n\\n  $: blogIdentifier = slugstr;\\n\\n  $: {\\n    if ($gotoElWidth > 1000) {\\n      // padding on both sides\\n      let numGotoControlsInOneRow = ($gotoElWidth - 154 * 2) / 32;\\n      let numGotoControlsRows =\\n        (displayposts.length + 5) / numGotoControlsInOneRow;\\n      tinygoto = numGotoControlsRows > 3;\\n    } else if ($gotoElWidth > 800) {\\n      // padding on right side\\n      let numGotoControlsInOneRow = ($gotoElWidth - (154 + 14)) / 32;\\n      let numGotoControlsRows =\\n        (displayposts.length + 5) / numGotoControlsInOneRow;\\n      tinygoto = numGotoControlsRows > 3;\\n    } else {\\n      // no padding\\n      let numGotoControlsInOneRow = ($gotoElWidth - (14 + 14)) / 32;\\n      let numGotoControlsRows =\\n        (displayposts.length + 5) / numGotoControlsInOneRow;\\n      tinygoto = numGotoControlsRows > 3;\\n    }\\n  }\\n\\n  // 1440 is to set numCols to 3. Setting to `0` would mean we start with 1 col, and then quickly update to 3 on desktop.\\n  const _gotoElWidth = writable(1440);\\n  const gotoElWidth = _gotoElWidth.pipe(throttle(500), startWith(1440));\\n\\n  $: loadError = res && !res.res.ok;\\n  let loading = false;\\n  let reloadstr = \\\"Load more\\\";\\n  let navigation = false;\\n\\n  let imageVideoStr = \\\"\\\";\\n  let portraitLandscapeStr = \\\"\\\";\\n  let downloadstr = \\\"\\\";\\n  let autoplaystr = \\\"\\\";\\n  let over18str = \\\"\\\";\\n  let deepsearchstr = \\\"\\\"; // Declare deepsearchstr\\n  \\n  let showhidestr = \\\"Show (h)\\\";\\n  let mutedstr = \\\"Sound Off\\\";\\n\\n  let autoplaytimer;\\n\\n  let filterRef;\\n  let filterExpanded = false;\\n  let filterValue = \\\"\\\";\\n  let subredditSearchValue = \\\"\\\"; // Declare subredditSearchValue\\n\\n  let showSettings = false;\\n\\n  let currpost = { title: \\\"Loading ..\\\" };\\n  let nexturls = [];\\n\\n  let index = 0;\\n\\n  async function loadMore() {\\n    if (!after) return;\\n\\n    loading = true;\\n    reloadstr = \\\"Loading ..\\\";\\n\\n    let newposts;\\n\\n    if (mode === \\\"tumblr\\\") {\\n      ({\\n        posts: newposts,\\n        after,\\n        ...res\\n      } = await get_tumblr_posts(\\n        `https://api.tumblr.com/v2/blog/${blogIdentifier}/posts?api_key=ru6b4z2sDMz7h0WyCULiNuqqgDfgubrdQZtZrVUkXQGkzFPTrF&offset=${after}&${queryp(params)}`\\n      ));\\n    }\\n\\n    console.log(\\\"API Response (res object):\\\", res);\\n    console.log(posts);\\n\\n    // load `favorite` from localstorage\\n    for (let p of newposts) {\\n      p[\\\"favorite\\\"] = !!(($favorite || {})[p.url]?.favorite);\\n    }\\n\\n    // Combine `posts` and `newposts` and remove duplicates from multiple network requests\\n    posts = [...posts, ...newposts].reduce(\\n      (r, i) => (!r.some((j) => i.id === j.id) ? [...r, i] : r),\\n      []\\n    );\\n    console.log(\\\"Before dedupe: \\\", posts.length);\\n\\n    // Remove duplicates, based on `url`\\n    posts = posts.filter((v, i, a) => a.findIndex((t) => t.url == v.url) === i);\\n\\n    console.log(\\\"After dedupe/Total loaded: \\\", posts.length);\\n\\n    loading = false;\\n    reloadstr = \\\"Load more\\\";\\n  }\\n\\n  onMount(async () => {\\n    console.log(\\\"Posts on mount:\\\", posts);\\n    console.log(\\\"Display Posts on mount:\\\", displayposts);\\n    loadMore(); // Call loadMore on mount\\n    // Start autoplay by default\\n    if ($autoplay) {\\n      startAutoPlay();\\n    }\\n  });\\n\\n  function startAutoPlay() {\\n    //console.log('START')\\n    autoplaytimer = setInterval(() => {\\n      // If `autoplay` is off and it is a video, the video will progress by itself via on:ended\\n      if ($autoplay && currpost.is_image) {\\n        //console.log('---- iNEXT')\\n        next();\\n      } else if (!$autoplay && currpost.is_video) {\\n        //console.log('---- vNEXT')\\n        next();\\n      }\\n    }, $autoplayinterval * 1000);\\n\\n    autoplay.set(true);\\n  }\\n\\n  async function prev() {\\n    if (currpost.is_album && albumindex > 0) {\\n      albumPrev();\\n    } else {\\n      itemPrev();\\n      await tick(); // Ensure currpost is updated\\n      if (currpost.is_album) {\\n        albumindex = currpost.preview.img.album.length - 1;\\n      }\\n    }\\n  }\\n\\n  async function next() {\\n    if (currpost.is_album && !isEndOfAlbum()) {\\n      albumNext();\\n    } else {\\n      itemNext();\\n      await tick(); // Ensure currpost is updated\\n    }\\n  }\\n\\n  function stopAutoPlay() {\\n    //console.log('STOP')\\n    clearInterval(autoplaytimer);\\n    autoplay.set(false);\\n  }\\n\\n  function stopAndStartAutoPlay() {\\n    stopAutoPlay();\\n\\n    startAutoPlay();\\n  }\\n\\n  function toggleAutoPlay() {\\n    if ($autoplay) {\\n      stopAutoPlay();\\n    } else {\\n      startAutoPlay();\\n    }\\n  }\\n\\n  function toggleImageVideo() {\\n    $imageVideo = $imageVideo + 1;\\n\\n    if ($imageVideo == 3) {\\n      $imageVideo = 0;\\n    }\\n  }\\n\\n  function uniqBy(a, key) {\\n    var seen = {};\\n    return a.filter(function(item) {\\n        var k = key(item);\\n        return seen.hasOwnProperty(k) ? false : (seen[k] = true);\\n    })\\n  }\\n\\n  function toggleMuted() {\\n    $muted = !$muted;\\n  }\\n\\n  function togglePortraitLandscape() {\\n    $portraitLandscape = $portraitLandscape + 1;\\n\\n    if ($portraitLandscape == 3) {\\n      $portraitLandscape = 0;\\n    }\\n  }\\n\\n  let renderVideo = true;\\n\\n  // Some operations like fav/unfav causes video to re-render\\n  // since we're changing post.favorite. This should help skip it\\n  let skipRenderVideo = false;\\n\\n  $: {\\n    if (!skipRenderVideo) reMountVideo(currpost.preview);\\n    skipRenderVideo = false;\\n  }\\n\\n  function reMountVideo() {\\n    renderVideo = false;\\n    setTimeout(() => (renderVideo = true), 0);\\n  }\\n\\n  $: {\\n    // Subreddit search\\n    if (subredditSearchValue) {\\n      //subredditSearchVisible = false;\\n      //ahref(`/r/${subredditSearchValue}`);\\n      //subredditSearchValue = \\\"\\\";\\n      //subredditSearchValueRaw = \\\"\\\";\\n      jumpToSubReddit(subredditSearchValue);\\n    }\\n  }\\n\\n  $: {\\n    numFavorite = displayposts.filter((item) => item.favorite == true).length;\\n\\n    if (!numFavorite) {\\n      downloadstr = `Nothing to download`;\\n    } else if (numFavorite == 1) {\\n      downloadstr = `Download ${numFavorite} file`;\\n    } else {\\n      downloadstr = `Download ${numFavorite} files`;\\n    }\\n    autoplaystr = `Autoplay is ${$autoplay ? \\\"on\\\" : \\\"off\\\"}`;\\n    deepsearchstr = `Search for ${filterValue}`;\\n\\n    mutedstr = `Sound ${$muted ? \\\"off\\\" : \\\"on\\\"}`;\\n\\n    if ($over18 == 0) {\\n      over18str = \\\"nsfw off\\\";\\n    } else if ($over18 == 1) {\\n      over18str = \\\"nsfw on\\\";\\n    } else if ($over18 == 2) {\\n      over18str = \\\"nsfw only\\\";\\n    }\\n\\n    if ($imageVideo == 0) {\\n      imageVideoStr = \\\"Show both image and video\\\";\\n    } else if ($imageVideo == 1) {\\n      imageVideoStr = \\\"Show videos only\\\";\\n    } else if ($imageVideo == 2) {\\n      imageVideoStr = \\\"Show images only\\\";\\n    }\\n\\n    if ($portraitLandscape == 0) {\\n      portraitLandscapeStr = \\\"Show all media\\\";\\n    } else if ($portraitLandscape == 1) {\\n      portraitLandscapeStr = \\\"Show only portrait media\\\";\\n    } else if ($portraitLandscape == 2) {\\n      portraitLandscapeStr = \\\"Show only landscape media\\\";\\n    }\\n  }\\n\\n  $: {\\n    if (displayposts[index]) {\\n      currpost = JSON.parse(JSON.stringify(displayposts[index]));\\n\\n      let _nexturls = [];\\n\\n      _nexturls = [\\n        currpost,\\n        ...displayposts.slice(index + 1, index + $prefetchNum + 1)\\n      ];\\n\\n      nexturls = _nexturls\\n        .map(function (item) {\\n          if (item.is_album) {\\n            return item.preview.img.album.slice(\\n              albumindex,\\n              albumindex + $prefetchNum + 1\\n            );\\n          } else {\\n            return item;\\n          }\\n        })\\n        .flat();\\n\\n      console.log(nexturls);\\n      nexturls = uniqBy(nexturls, () => (item) => item.preview.img.default);\\n    } else if (filterValue) {\\n      // We're here because user filtered the list\\n\\n      // Unfortunately the filtered list is smaller than the current index\\n      // set index to last item\\n      if (displayposts.length > 0) {\\n        console.log(\\\"setting index from \\\", index, \\\" to \\\", displayposts.length);\\n        index = displayposts.length - 1;\\n        console.log(\\\"loading more ..\\\");\\n        loadMore();\\n      } else {\\n        // nothing was filtered\\n        index = 0;\\n        currpost = {\\n          title: \\\"Nothing to show. Try changing filters or tweak/update URL.\\\"\\n        };\\n      }\\n    } else {\\n      if (res && res.res.ok) {\\n        // No media found\\n        currpost = {\\n          title: \\\"Nothing to show. Try changing filters or tweak/update URL.\\\"\\n        };\\n      } else if (res && !res.res.ok) {\\n        // Invalid subreddit\\n        currpost = { title: \\\"Error\\\" };\\n      } else {\\n        // Default\\n        currpost = { title: \\\"Loading ..\\\" };\\n      }\\n\\n      nexturls = [];\\n    }\\n  }\\n\\n  $: {\\n    let tmp = [];\\n\\n    if ($over18 == 0) {\\n      tmp = posts.filter((item) => item.over18 == false);\\n    } else if ($over18 == 1) {\\n      tmp = posts;\\n    } else if ($over18 == 2) {\\n      tmp = posts.filter((item) => item.over18 == true);\\n    }\\n\\n    if (filterValue) {\\n      skipRenderVideo = true;\\n      tmp = tmp.filter((item) =>\\n        item.title.toLowerCase().includes(filterValue.toLowerCase())\\n      );\\n    }\\n\\n    // Filter only videos\\n    if ($imageVideo == 1) {\\n      tmp = tmp.filter((item) => item.is_video);\\n    }\\n    // Filter only images\\n    else if ($imageVideo == 2) {\\n      tmp = tmp.filter((item) => item.is_image);\\n    }\\n\\n    if ($portraitLandscape == 1) {\\n      tmp = tmp.filter((item) => item.dims.width / item.dims.height <= 1.2);\\n    } else if ($portraitLandscape == 2) {\\n      tmp = tmp.filter((item) => item.dims.width / item.dims.height > 1.2);\\n    }\\n\\n    displayposts = tmp;\\n  }\\n\\n  function goto(i) {\\n    albumindex = 0;\\n    index = i;\\n\\n    let itemNum = displayposts.length - index;\\n\\n    // If autoplay is on and we're jumping to 2 or 3, we must load\\n    if ((itemNum == 2 || itemNum == 3) && $autoplay) {\\n      console.log(\\\"[goto-to-2/3]: loading ..\\\");\\n      loadMore();\\n    }\\n\\n    // Last item\\n    if (itemNum === 1) {\\n      console.log(\\\"[goto-to-lastitem]: loading ..\\\");\\n      loadMore();\\n    }\\n\\n    if ($autoplay) stopAndStartAutoPlay();\\n  }\\n\\n  function videoended() {\\n    itemNext();\\n  }\\n\\n  function itemNext() {\\n    albumindex = 0; // Always reset album index to 0 when moving to a new post\\n    let itemNum = displayposts.length - 1 - index;\\n\\n    // Last item, dont go past the last item\\n    if (itemNum <= 1) {\\n      index = displayposts.length - 1;\\n\\n      console.log(\\\"[lastitem, autoplay+filter?]: loading more ..\\\");\\n      // Reached last item, possibly by autoplay + filter\\n      loadMore();\\n\\n      return;\\n    }\\n\\n    // Auto trigger on the last 4th item\\n    if (itemNum === 4 || itemNum === 3) {\\n      console.log(\\\"[4th last item, normal]: loading more ..\\\");\\n      loadMore();\\n    }\\n\\n    // If we're at 3rd/2nd last item with a filter, the user\\n    // possibly just filtered the list and ended up here.\\n    // trigger a load more. We dont want to do it always since\\n    // we normally trigger loadmore @3rd last item. Always doing it\\n    // Would end up with 2 requests to reddit.com\\n    if (itemNum === 2 && filterValue) {\\n      console.log(\\\"[2nd last item, filtering?]: loading more ..\\\");\\n      loadMore();\\n    }\\n\\n    index += 1;\\n\\n    if ($autoplay) stopAndStartAutoPlay();\\n  }\\n\\n  async function itemPrev() {\\n    if (index === 0) return;\\n    index -= 1;\\n\\n    albumindex = 0; // Always reset album index to 0 when moving to a new post\\n\\n    await tick(); // Ensure currpost is updated before accessing its properties\\n\\n    if (displayposts.length - index === 3) {\\n      loadMore();\\n    }\\n    if ($autoplay) stopAndStartAutoPlay();\\n  }\\n\\n  function toggleFullscreen() {\\n    var elem = document.body;\\n    if (\\n      document.fullscreenElement || // alternative standard method\\n      document.mozFullScreenElement ||\\n      document.webkitFullscreenElement ||\\n      document.msFullscreenElement\\n    ) {\\n      // current working methods\\n      if (document.exitFullscreen) {\\n        document.exitFullscreen();\\n      } else if (document.msExitFullscreen) {\\n        document.msExitFullscreen();\\n      } else if (document.mozCancelFullScreen) {\\n        document.mozCancelFullScreen();\\n      } else if (document.webkitExitFullscreen) {\\n        document.webkitExitFullscreen();\\n      }\\n      if (!uiVisible) {\\n        toggleUIVisiblity();\\n      }\\n    } else {\\n      if (elem.requestFullscreen) {\\n        elem.requestFullscreen();\\n      } else if (elem.msRequestFullscreen) {\\n        elem.msRequestFullscreen();\\n      } else if (elem.mozRequestFullScreen) {\\n        elem.mozRequestFullScreen();\\n      } else if (elem.webkitRequestFullscreen) {\\n        elem.webkitRequestFullscreen();\\n      }\\n      if (uiVisible) {\\n        toggleUIVisiblity();\\n      }\\n    }\\n  }\\n\\n  function onVideoPlayerClicked(ev) {\\n    const r = document.getElementById('videoplayerid').getBoundingClientRect();\\n    const x = ev.offsetX / r.width;\\n    const activePart = 1/5;\\n\\n    if (x < activePart) {\\n      itemPrev();\\n    } else if (x > (1-activePart)) {\\n      itemNext();\\n    }\\n  }\\n\\n  function toggleHideCursor() {\\n    hideCursor = false;\\n    if (hideCursorTimerId) {\\n      clearTimeout(hideCursorTimerId);\\n    }\\n    hideCursorTimerId = setTimeout(() => {\\n      hideCursorTimerId = 0;\\n      hideCursor = true;\\n    }, 3000);\\n  }\\n\\n  function toggleTitleVisibility() {\\n    titleVisible = !titleVisible;\\n  }\\n\\n  function toggleUIVisiblity() {\\n    uiVisible = !uiVisible;\\n\\n    showhidestr = uiVisible ? \\\"Hide (h)\\\" : \\\"Show (h)\\\";\\n\\n    if (hideCursorTimerId) {\\n      clearTimeout(hideCursorTimerId);\\n      hideCursorTimerId = 0;\\n    }\\n\\n    if (!uiVisible) {\\n      hideCursor = true;\\n    } else {\\n      hideCursor = false;\\n    }\\n  }\\n\\n  function toggleSettings() {\\n    showSettings = !showSettings;\\n  }\\n\\n  function gotoDeepSearch() {\\n    let prefix = \\\"\\\";\\n    if (slugstr) {\\n      prefix = `/r/${subreddit}`;\\n    } else {\\n      prefix = ``;\\n    }\\n\\n    navigation = true;\\n    ahref(\\n      `${prefix}/search?q=${filterValue}&restrict_sr=on&include_over_18=on&sort=relevant&t=all`\\n    );\\n  }\\n\\n  function hideSettings() {\\n    showSettings = false;\\n  }\\n\\n  \\n\\n  async function expandFilter() {\\n    filterExpanded = true;\\n\\n    await tick();\\n\\n    // Focus the input if we just opened it\\n    if (filterExpanded) filterRef.querySelector(\\\"input\\\").focus();\\n  }\\n\\n  async function toggleFilter() {\\n    filterExpanded = !filterExpanded;\\n\\n    await tick();\\n    // Focus the input if we just opened it\\n    if (filterExpanded) filterRef.querySelector(\\\"input\\\").focus();\\n  }\\n\\n  async function downloadFiles() {\\n    window.open(\\\"/download\\\", \\\"_blank\\\");\\n  }\\n\\n  async function shuffleFiles() {\\n    displayposts = shuffle(displayposts);\\n  }\\n\\n  function openMedia() {\\n    window.open(currpost.url, \\\"_blank\\\");\\n  }\\n\\n  \\n\\n  function copySrcToClipboard() {\\n    let text;\\n    if (\\n      currpost.url.startsWith(\\\"https://v.redd.it/\\\") ||\\n      currpost.url.includes(\\\"redgifs.com\\\")\\n    ) {\\n      text = currpost.preview.vid.mp4;\\n    } else if (currpost.is_image && !currpost.is_album) {\\n      text = currpost.url;\\n    } else if (currpost.is_video) {\\n      text = currpost.url;\\n    } else if (currpost.is_album) {\\n      if (currpost.preview.img.album[albumindex].is_video) {\\n        text = currpost.preview.img.album[albumindex].hires;\\n      } else {\\n        text = currpost.preview.img.album[albumindex].hires;\\n      }\\n    }\\n\\n    navigator.clipboard\\n      .writeText(text)\\n      .then(() => console.log(`Copied: ${text}`));\\n  }\\n\\n  function toggleOver18() {\\n    $over18 = $over18 + 1;\\n\\n    if ($over18 == 3) {\\n      $over18 = 0;\\n    }\\n    over18.set($over18);\\n  }\\n\\n  function removeAllFavorite(removeAllFromLocalStorage) {\\n    skipRenderVideo = true;\\n\\n    for (const [i, post] of displayposts.entries()) {\\n      // For reactivity\\n      displayposts[i].favorite = false;\\n\\n      // If removeAllFromLocalStorage is true, then we'll remove everythign in one shot\\n      // no need to do it one by one\\n      if (removeAllFromLocalStorage == false) {\\n        // Localstorage\\n        $favorite[post.url] = undefined;\\n        $favorite = JSON.parse(JSON.stringify($favorite));\\n\\n        favorite.set($favorite);\\n      }\\n    }\\n\\n    if (removeAllFromLocalStorage) {\\n      favorite.set({});\\n    }\\n  }\\n  function toggleFavorite() {\\n    skipRenderVideo = true;\\n    displayposts[index].favorite = !displayposts[index].favorite;\\n\\n    let url = displayposts[index].url;\\n    $favorite[url] = undefined;\\n    $favorite = JSON.parse(JSON.stringify($favorite));\\n    $favorite[url] = displayposts[index];\\n    favorite.set($favorite);\\n  }\\n\\n  function albumPrev() {\\n    if (!currpost.is_album) return;\\n    albumindex -= 1;\\n    if ($autoplay) stopAndStartAutoPlay();\\n  }\\n\\n  function isEndOfAlbum() {\\n    return albumindex == currpost.preview.img.album.length - 1;\\n  }\\n\\n  function isStartOfAlbum() {\\n    return albumindex == 0;\\n  }\\n\\n  function albumNext() {\\n    if (!currpost.is_album) return;\\n\\n    if (isEndOfAlbum()) {\\n      albumindex = 0;\\n    } else {\\n      albumindex += 1;\\n    }\\n\\n    if ($autoplay) stopAndStartAutoPlay();\\n  }\\n\\n  function wheel(event) {\\n    if (event.deltaY > 0) {\\n      next();\\n    } else if (event.deltaY < 0) {\\n      prev();\\n    }\\n  }\\n\\n  function keydown(event) {\\n    // up\\n    if (event.keyCode == 38) {\\n      next();\\n    }\\n\\n    // down\\n    if (event.keyCode == 40) {\\n      prev();\\n    }\\n\\n    // s\\n    if (event.keyCode == 83) {\\n      toggleMuted();\\n    }\\n\\n    // q, p\\n    if (event.keyCode == 81 || event.keyCode == 80) {\\n      toggleAutoPlay();\\n    }\\n\\n    // f\\n    if (event.keyCode == 70 && !event.ctrlKey) {\\n      toggleFullscreen();\\n    }\\n\\n    // slash, f\\n    if (event.keyCode == 191) {\\n      expandFilter();\\n      // We need this, otherwise filter box will have '/' because of autofocus\\n      event.preventDefault();\\n    }\\n\\n    // x\\n    if (event.keyCode == 88) {\\n      if (event.shiftKey) {\\n        removeAllFavorite(event.ctrlKey); // if ctrl+shift+x is remove everything from localstorage\\n      } else {\\n        toggleFavorite();\\n      }\\n    }\\n\\n    if (event.ctrlKey) {\\n      return;\\n    }\\n\\n    // i\\n    if (event.keyCode == 73) {\\n      openMedia();\\n    }\\n\\n    // h\\n    if (event.keyCode == 72) {\\n      toggleUIVisiblity();\\n    }\\n\\n    // t\\n    if (event.keyCode == 84) {\\n      toggleTitleVisibility();\\n    }\\n\\n    // v\\n    if (event.keyCode == 118) {\\n      toggleImageVideo();\\n    }\\n\\n    // c\\n    if (event.keyCode == 67) {\\n      copySrcToClipboard();\\n    }\\n\\n    const n = event.keyCode - 48;\\n    if (n >= 0 && n <= 3) {\\n      const video = document.getElementById('videoplayerid');\\n      video.currentTime = n * video.duration / 4;\\n    }\\n\\n    // Left Arrow, a, k, Page-up\\n    if (\\n      event.keyCode == 37 ||\\n      event.keyCode == 65 ||\\n      event.keyCode == 75 ||\\n      event.keyCode == 33\\n    ) {\\n      if (event.shiftKey) {\\n        const video = document.getElementById('videoplayerid');\\n        video.currentTime -= 5;\\n      } else {\\n        itemPrev();\\n      }\\n    }\\n    // Right Arrow, d, j, Space, Page-down\\n    else if (\\n      event.keyCode == 39 ||\\n      event.keyCode == 68 ||\\n      event.keyCode == 74 ||\\n      event.keyCode == 32 ||\\n      event.keyCode == 34\\n    ) {\\n      if (event.shiftKey) {\\n        const video = document.getElementById('videoplayerid');\\n        video.currentTime += 5;\\n      } else {\\n        itemNext();\\n      }\\n    }\\n  }\\n</script>\\n\\n<svelte:window on:keydown={keydown} on:wheel={wheel} />\\n<svelte:head>\\n  <title>tumblrpx - {slugstr ? `t/${slugstr}` : \\\"tumblr.com\\\"}</title>\\n</svelte:head>\\n\\n<div class=\\\"wrapper\\\" class:hide-cursor=\\\"{hideCursor}\\\">\\n  <div class=\\\"hero\\\">\\n    <div class=\\\"title\\\" class:hide=\\\"{!uiVisible || !titleVisible}\\\" class:favorite=\\\"{currpost.favorite}\\\">\\n      {#if displayposts.length}\\n        <span class=\\\"fav\\\" on:click|stopPropagation|preventDefault=\\\"{toggleFavorite}\\\">\\n          <Icon icon=\\\"{currpost.favorite ? faFav : faUnFav}\\\"></Icon>\\n        </span>\\n      {/if}\\n      {#if currpost.dims}\\n        {title} ({currpost.dims.width}x{currpost.dims.height})\\n      {:else}\\n        {title}\\n      {/if}\\n      {#if currpost.subreddit}\\n        <div class=\\\"subreddit\\\">\\n          <p class=\\\"subredditp\\\">{currpost.subredditp}</p>\\n          <p class=\\\"user\\\">{currpost.authorp}</p>\\n        </div>\\n      {/if}\\n    </div>\\n    <div class=\\\"settings\\\">\\n      <a class=\\\"donate\\\" href=\\\"https://ko-fi.com/redditpx\\\" target=\\\"_blank\\\" class:hide=\\\"{currpost.favorite == false}\\\">\\n        <span class=\\\"btn tooltip bottom donate\\\" data-tooltip=\\\"Donate\\\">\\n          <Icon icon=\\\"{faDonate}\\\"></Icon>\\n        </span>\\n      </a>\\n      <a class=\\\"home\\\" rel=\\\"prefetch\\\" href=\\\"/home\\\" class:hide=\\\"{uiVisible == false}\\\">\\n        <span class=\\\"btn tooltip bottom\\\" data-tooltip=\\\"Home\\\">\\n          <Icon icon=\\\"{faHome}\\\"></Icon>\\n        </span>\\n      </a>\\n      <span class=\\\"btn cog\\\" on:click=\\\"{toggleSettings}\\\" class:showSettings=\\\"{showSettings}\\\" class:hide=\\\"{uiVisible == false}\\\">\\n        <Icon icon=\\\"{faSettings}\\\"></Icon>\\n      </span>\\n      <div class=\\\"div\\\" class:hide=\\\"{uiVisible == false}\\\">\\n        <Settings bind:showSettings></Settings>\\n      </div>\\n    </div>\\n    <div class=\\\"main-media-container\\\">\\n      {#if currpost.is_image && !currpost.is_album}\\n        <img src=\\\"{currpost.preview.img.default}\\\" alt=\\\"{currpost.title}\\\" style=\\\"max-width: 100%; max-height: 100vh; object-fit: contain;\\\">\\n      {:else if currpost.is_video && renderVideo}\\n        <video class=\\\"video\\\" autoplay loop=\\\"{!$autoplay}\\\" playsinline muted=\\\"{$muted}\\\" on:ended=\\\"{videoended}\\\" on:dblclick=\\\"{toggleFullscreen}\\\" class:hide-cursor=\\\"{hideCursor}\\\" on:mousemove=\\\"{toggleHideCursor}\\\" id=\\\"videoplayerid\\\" on:click=\\\"{onVideoPlayerClicked}\\\">\\n          {#if $lores}\\n            <source src=\\\"{currpost.preview.vid.lores}\\\">\\n          {:else}\\n            {#if currpost.preview.vid.webm}\\n              <source src=\\\"{currpost.preview.vid.webm}\\\">\\n            {/if}\\n            {#if currpost.preview.vid.mp4}\\n              <source src=\\\"{currpost.preview.vid.mp4}\\\">\\n            {/if}\\n          {/if}\\n        </video>\\n      {:else if currpost.is_album}\\n        {#if currpost.preview.img.album[albumindex].is_video}\\n          <video class=\\\"video\\\" autoplay loop=\\\"{!$autoplay}\\\" playsinline muted=\\\"{$muted}\\\" on:ended=\\\"{videoended}\\\" on:dblclick=\\\"{toggleFullscreen}\\\" class:hide-cursor=\\\"{hideCursor}\\\" on:mousemove=\\\"{toggleHideCursor}\\\" on:click=\\\"{onVideoPlayerClicked}\\\">\\n            <source src=\\\"{currpost.preview.img.album[albumindex].hires}\\\">\\n          </video>\\n        {:else}\\n          <img src=\\\"{currpost.preview.img.album[albumindex].default}\\\" alt=\\\"{currpost.title}\\\" style=\\\"max-width: 100%; max-height: 100vh; object-fit: contain;\\\">\\n        {/if}\\n      {/if}\\n    </div>\\n    \\n    {#if displayposts.length || posts.length}\\n      <div class=\\\"goto\\\" class:tinygoto=\\\"{tinygoto}\\\" class:hide=\\\"{uiVisible == false}\\\" bind:clientWidth=\\\"{$_gotoElWidth}\\\">\\n        <div class=\\\"btnwrapper\\\">\\n          <span class=\\\"btn playpause tooltip\\\"\\n            data-tooltip=\\\"{autoplaystr}\\\"\\n            class:play=\\\"{$autoplay}\\\"\\n            on:click=\\\"{toggleAutoPlay}\\\"\\n          >\\n            <Icon icon=\\\"{$autoplay ? faPause : faPlay}\\\"></Icon>\\n          </span>\\n          <span class=\\\"btn download tooltip\\\"\\n            on:click=\\\"{downloadFiles}\\\"\\n            data-tooltip=\\\"{downloadstr}\\\"\\n            class:dlready=\\\"{numFavorite}\\\"\\n          >\\n            <Icon icon=\\\"{faDownload}\\\"></Icon>\\n          </span>\\n          <span class=\\\"btn dice tooltip\\\"\\n            on:click=\\\"{shuffleFiles}\\\"\\n            data-tooltip=\\\"Shuffle\\\"\\n          >\\n            <Icon icon=\\\"{faDice}\\\"></Icon>\\n          </span>\\n          <span class=\\\"btn portraitlandscape tooltip\\\"\\n            on:click=\\\"{togglePortraitLandscape}\\\"\\n            data-tooltip=\\\"{portraitLandscapeStr}\\\"\\n            class:active=\\\"{$portraitLandscape}\\\"\\n          >\\n            {#if $portraitLandscape == 0}\\n              <Icon icon=\\\"{faLandscape}\\\"></Icon>\\n            {:else if $portraitLandscape == 1}\\n              <Icon icon=\\\"{faPortrait}\\\"></Icon>\\n            {:else if $portraitLandscape == 2}\\n              <Icon class=\\\"landscape\\\" icon=\\\"{faPortrait}\\\"></Icon>\\n            {/if}\\n          </span>\\n          <span class=\\\"btn imagevideo tooltip\\\"\\n            data-tooltip=\\\"{imageVideoStr}\\\"\\n            on:click=\\\"{toggleImageVideo}\\\"\\n          >\\n            {#if $imageVideo == 0}\\n              <Icon icon=\\\"{faImageVideo}\\\"></Icon>\\n            {:else if $imageVideo == 1}\\n              <Icon icon=\\\"{faVideo}\\\"></Icon>\\n            {:else if $imageVideo == 2}\\n              <Icon icon=\\\"{faImage}\\\"></Icon>\\n            {/if}\\n          </span>\\n          <span class=\\\"btn muted tooltip\\\"\\n            data-tooltip=\\\"{mutedstr}\\\"\\n            on:click=\\\"{toggleMuted}\\\"\\n          >\\n            <Icon icon=\\\"{$muted ? faSoundOff : faSoundOn}\\\"></Icon>\\n          </span>\\n          {#if tinygoto}\\n            <span class=\\\"btn reload tooltip\\\" data-tooltip=\\\"{reloadstr}\\\" on:click=\\\"{loadMore}\\\" class:loaderror=\\\"{loadError}\\\">\\n              {#if loading}\\n                <Icon icon=\\\"{faSpinner}\\\"></Icon>\\n              {:else}\\n                <Icon icon=\\\"{faSync}\\\"></Icon>\\n              {/if}\\n            </span>\\n          {/if}\\n          <span class=\\\"btn over18wrapper tooltip\\\"\\n            data-tooltip=\\\"{over18str}\\\"\\n            class:over18=\\\"{!$over18}\\\"\\n            on:click=\\\"{toggleOver18}\\\"\\n          >\\n            <p>{over18str}</p>\\n          </span>\\n          <span class=\\\"btn filter tooltip\\\"\\n            class:filterExpanded=\\\"{filterExpanded}\\\"\\n            on:click=\\\"{toggleFilter}\\\"\\n            data-tooltip=\\\"Filter ( / )\\\"\\n            bind:this=\\\"{filterRef}\\\"\\n            class:dlready=\\\"{numFavorite}\\\"\\n          >\\n            {#if filterExpanded}\\n              <input bind:value=\\\"{filterValue}\\\" on:click|stopPropagation on:keydown|stopPropagation type=\\\"text\\\">\\n            {:else}\\n              <Icon icon=\\\"{faSearch}\\\"></Icon>\\n            {/if}\\n          </span>\\n          {#if filterValue}\\n            <span class=\\\"btn deepsearch tooltip\\\" data-tooltip=\\\"{deepsearchstr}\\\" on:click=\\\"{gotoDeepSearch}\\\">\\n              <p>deep search 🠒</p>\\n            </span>\\n          {/if}\\n        </div>\\n        <div class=\\\"numswrapper\\\">\\n          {#each displayposts as post, i (post.id + post.url)}\\n            <span class=\\\"nums\\\"\\n              class:currnum=\\\"{index === i}\\\"\\n              class:album=\\\"{currpost.is_album}\\\"\\n              class:favorite=\\\"{displayposts[i].favorite}\\\"\\n              class:over18=\\\"{displayposts[i].over18}\\\"\\n              on:click=\\\"{function(){goto(i)}}\\\"\\n            >\\n              <img class=\\\"small\\\" alt=\\\"{displayposts[i].title}\\\" src=\\\"{displayposts[i].thumbnail}\\\">\\n              <p class=\\\"small\\\" class:curr=\\\"{index === i}\\\" class:album=\\\"{currpost.is_album}\\\">{i+1}</p>\\n            </span>\\n          {/each}\\n          {#if !tinygoto}\\n            <span class=\\\"displayinfo\\\" class:filterExpanded=\\\"{filterValue}\\\">\\n              <p>{displayposts.length}/{posts.length}</p>\\n            </span>\\n            <span class=\\\"btn reload tooltip\\\" data-tooltip=\\\"{reloadstr}\\\" on:click=\\\"{loadMore}\\\" class:loaderror=\\\"{loadError}\\\">\\n              {#if loading}\\n                <Icon icon=\\\"{faSpinner}\\\"></Icon>\\n              {:else}\\n                <Icon icon=\\\"{faSync}\\\"></Icon>\\n              {/if}\\n            </span>\\n          {/if}\\n        </div>\\n      </div>\\n    {/if}\\n  </div>\\n</div>\\n{#if $prefetch}\\n  <div class=\\\"prefetch\\\">\\n    {#each nexturls as nexturl (nexturl.preview.img.default)}\\n      {#if $hires}\\n        {#if nexturl.is_album}\\n          <img alt=\\\"prefetch-hires\\\" src=\\\"{nexturl.preview.img.album[0].hires}\\\">\\n        {:else}\\n          <img alt=\\\"prefetch-hires\\\" src=\\\"{nexturl.url}\\\">\\n        {/if}\\n      {:else}\\n        {#if nexturl.is_album}\\n          <img alt=\\\"prefetch\\\" src=\\\"{nexturl.preview.img.album[0].default}\\\">\\n        {:else if nexturl.preview}\\n          <img alt=\\\"prefetch\\\" src=\\\"{nexturl.preview.img.default}\\\">\\n        {:else}\\n          <img alt=\\\"prefetch\\\" src=\\\"{nexturl.default}\\\">\\n        {/if}\\n      {/if}\\n      {#if nexturl.is_video}\\n        <video playsinline autoplay loop muted>\\n          {#if $lores}\\n            <source src=\\\"{nexturl.preview.vid.lores}\\\">\\n          {:else}\\n            {#if nexturl.preview}\\n              {#if nexturl.preview.vid.webm}\\n                <source src=\\\"{nexturl.preview.vid.webm}\\\">\\n              {/if}\\n              {#if nexturl.preview.vid.mp4}\\n                <source src=\\\"{nexturl.preview.vid.mp4}\\\">\\n              {/if}\\n            {:else}\\n              <source src=\\\"{nexturl.default}\\\">\\n            {/if}\\n          {/if}\\n        </video>\\n      {/if}\\n    {/each}\\n  </div>\\n{/if}\\n\\n<style lang=\\\"sass\\\">.hide-cursor {\\n  cursor: none;\\n}\\n\\n.hide {\\n  display: none !important;\\n}\\n\\n.wrapper {\\n  height: 100vh;\\n  display: grid;\\n  justify-items: center;\\n  align-items: center;\\n}\\n.wrapper .hero {\\n  height: 100vh;\\n  width: 100vw;\\n  display: flex;\\n  flex-direction: column;\\n  justify-content: space-between;\\n  align-items: center;\\n}\\n.wrapper .hero .title {\\n  z-index: 10;\\n  position: absolute;\\n  left: 1rem;\\n  top: 0;\\n  background-color: rgba(0, 0, 0, 0.4);\\n  color: #fafafa;\\n  font-size: 1.5rem;\\n  max-width: 77%;\\n  padding: 1rem;\\n  border-radius: 3px;\\n}\\n.wrapper .hero .settings {\\n  z-index: 10;\\n  position: absolute;\\n  top: 0;\\n  right: 0;\\n  color: #fafafa;\\n  font-size: 1rem;\\n  padding: 1.5rem 2rem;\\n}\\n.wrapper .hero .main-media-container {\\n  flex-grow: 1;\\n  display: flex;\\n  justify-content: center;\\n  align-items: center;\\n  width: 100%;\\n  height: 100%;\\n}\\n.wrapper .hero .main-media-container img, .wrapper .hero .main-media-container video {\\n  max-width: 100%;\\n  max-height: 100%;\\n  object-fit: contain;\\n}\\n.wrapper .hero .goto {\\n  user-select: none;\\n  z-index: 5;\\n  position: absolute;\\n  background-color: rgba(0, 0, 0, 0.6);\\n  bottom: 0;\\n  display: grid;\\n  grid-row-gap: 5px;\\n  padding: 1rem 11rem;\\n  border-radius: 3px;\\n  color: #fafafa;\\n  width: 100%;\\n  grid-template-columns: repeat(auto-fill, minmax(32px, 1fr));\\n}\\n.wrapper .hero .goto.tinygoto {\\n  grid-template-rows: auto 1fr;\\n  grid-template-columns: 1fr;\\n}\\n.wrapper .hero .goto.tinygoto .btnwrapper {\\n  grid-template-columns: repeat(auto-fill, minmax(32px, 1fr));\\n  display: grid;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper {\\n  grid-template-columns: repeat(auto-fit, minmax(1rem, auto));\\n  grid-auto-columns: max-content;\\n  display: grid;\\n  grid-gap: 0.2rem;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .nums {\\n  border-bottom: 3px solid rgba(255, 255, 255, 0.3);\\n  height: 1rem;\\n  cursor: pointer;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto.tinygoto .numswrapper .nums:hover {\\n    border-bottom: 3px solid white !important;\\n  }\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .nums.currnum {\\n  border-bottom: 3px solid white !important;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .nums.currnum.album {\\n  border-bottom: 3px dotted white !important;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .nums.favorite {\\n  border-bottom: 3px solid #fbbc04;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .nums.over18 {\\n  border-bottom: 3px solid #ea4335;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper p {\\n  display: none;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .reload {\\n  grid-column: span 2;\\n}\\n.wrapper .hero .goto .btnwrapper, .wrapper .hero .goto .numswrapper {\\n  display: contents;\\n}\\n.wrapper .hero .goto .btnwrapper .reload {\\n  bottom: -1px;\\n}\\n.wrapper .hero .goto .numswrapper .displayinfo {\\n  grid-column: span 1;\\n  font-size: 0.8rem;\\n  margin-top: 2px;\\n}\\n.wrapper .hero .goto .numswrapper .displayinfo p {\\n  margin: 0;\\n  text-align: center;\\n}\\n.wrapper .hero .goto .btn {\\n  text-align: center;\\n  padding-top: 2px;\\n  color: rgba(255, 255, 255, 0.3);\\n}\\n.wrapper .hero .goto .btn.reload {\\n  cursor: pointer;\\n}\\n.wrapper .hero .goto .btn.reload.loaderror {\\n  color: #ea4335;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn.reload:hover {\\n    color: white;\\n  }\\n}\\n.wrapper .hero .goto .btn.deepsearch {\\n  grid-column: span 4;\\n  bottom: 2px;\\n  cursor: pointer;\\n  justify-self: center;\\n}\\n.wrapper .hero .goto .btn.deepsearch:hover p {\\n  color: white;\\n  border: 1px solid white;\\n}\\n.wrapper .hero .goto .btn.deepsearch p {\\n  margin: 0;\\n  font-size: 0.9rem;\\n  color: #b3b3b3;\\n  border: 1px solid #b3b3b3;\\n  border-radius: 3px;\\n  padding: 0 1rem;\\n}\\n.wrapper .hero .goto .btn.over18wrapper {\\n  cursor: pointer;\\n  grid-column: span 2;\\n  justify-self: center;\\n}\\n.wrapper .hero .goto .btn.over18wrapper.over18 p {\\n  border: 1px solid rgba(255, 255, 255, 0.3);\\n  color: rgba(255, 255, 255, 0.3);\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn.over18wrapper.over18 p:hover {\\n    border: 1px solid rgba(255, 255, 255, 0.6);\\n    color: rgba(255, 255, 255, 0.6);\\n  }\\n}\\n.wrapper .hero .goto .btn.over18wrapper p {\\n  font-size: 0.9rem;\\n  border: 1px solid #ea4335;\\n  border-radius: 3px;\\n  color: #ea4335;\\n  margin: 0;\\n  width: 58px;\\n  font-family: \\\"Roboto Condensed\\\", sans-serif;\\n  position: relative;\\n  top: -1px;\\n}\\n.wrapper .hero .goto .btn.imagevideo {\\n  cursor: pointer;\\n  font-size: 1.4rem;\\n  bottom: 2px;\\n  color: white;\\n}\\n.wrapper .hero .goto .btn.layout {\\n  cursor: pointer;\\n  font-size: 1.4rem;\\n  bottom: 2px;\\n}\\n.wrapper .hero .goto .btn.layout.active {\\n  color: white;\\n}\\n.wrapper .hero .goto .btn.muted {\\n  cursor: pointer;\\n  font-size: 1.4rem;\\n  bottom: 2px;\\n  color: white;\\n}\\n.wrapper .hero .goto .btn.portraitlandscape {\\n  cursor: pointer;\\n  font-size: 1.4rem;\\n  bottom: 2px;\\n  color: white;\\n}\\n.wrapper .hero .goto .btn.portraitlandscape :global(.landscape) {\\n  transform: rotate(270deg);\\n}\\n.wrapper .hero .goto .btn.dice {\\n  cursor: pointer;\\n  font-size: 1.4rem;\\n  bottom: 2px;\\n  color: white;\\n}\\n.wrapper .hero .goto .btn.download {\\n  cursor: default;\\n  font-size: 1.4rem;\\n  bottom: 2px;\\n}\\n.wrapper .hero .goto .btn.download.dlready {\\n  color: rgba(251, 188, 4, 0.9);\\n  cursor: pointer;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn.download.dlready:hover {\\n    color: #f9ab00;\\n  }\\n}\\n.wrapper .hero .goto .btn.playpause {\\n  cursor: pointer;\\n  top: 1px;\\n}\\n.wrapper .hero .goto .btn.playpause.play {\\n  color: white;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn.playpause:hover {\\n    color: white;\\n  }\\n}\\n.wrapper .hero .goto .btn.filter {\\n  cursor: pointer;\\n  top: 1px;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn.filter:hover {\\n    color: white;\\n  }\\n}\\n.wrapper .hero .goto .btn.filter.filter.filterExpanded {\\n  grid-column: span 3;\\n  top: -2px;\\n}\\n.wrapper .hero .goto .btn.filter.filter.filterExpanded input {\\n  width: 85%;\\n  margin-left: 0px;\\n  padding-left: 5px;\\n  padding-right: 5px;\\n  border: 1px solid rgba(255, 255, 255, 0.6);\\n  background-color: rgba(0, 0, 0, 0);\\n  color: white;\\n}\\n.wrapper .hero .goto span {\\n  position: relative;\\n}\\n.wrapper .hero .goto span.favorite p.small {\\n  border-bottom: 3px solid #e37400 !important;\\n  color: #fbbc04;\\n}\\n.wrapper .hero .goto span.favorite img.small {\\n  border-color: #e37400 !important;\\n}\\n.wrapper .hero .goto span.over18 p.small {\\n  color: #ea4335;\\n  border-bottom: 3px solid #ea4335;\\n}\\n.wrapper .hero .goto span.over18 img.small {\\n  border-color: #ea4335;\\n}\\n.wrapper .hero .goto span p.small {\\n  margin: 0 2px;\\n  text-align: center;\\n  cursor: pointer;\\n  border-bottom: 3px solid rgba(0, 0, 0, 0);\\n}\\n.wrapper .hero .goto span p.small.curr {\\n  background-color: rgba(255, 255, 255, 0.2);\\n  border-bottom: 3px solid white !important;\\n}\\n.wrapper .hero .goto span p.small.curr.album {\\n  border-bottom: 3px dashed white !important;\\n}\\n.wrapper .hero .goto span img.small {\\n  z-index: 10;\\n  width: 0px;\\n  opacity: 0;\\n  position: absolute;\\n  bottom: 35px;\\n  border: 2px solid white;\\n  background-color: #4d4d4d;\\n  min-width: 100px;\\n  pointer-events: none;\\n  object-fit: cover;\\n}\\n.wrapper .hero .goto span:hover p.small {\\n  background-color: rgba(255, 255, 255, 0.1);\\n  border-bottom: 3px solid white !important;\\n}\\n.wrapper .hero .goto span:hover img {\\n  width: auto;\\n  height: 100px;\\n  opacity: 1;\\n}\\n.wrapper .hero .subredditsearchwrapper {\\n  height: 100vh;\\n  width: 100vw;\\n  position: absolute;\\n  background-color: rgba(0, 0, 0, 0.7);\\n  z-index: 15;\\n}\\n.wrapper .hero .subredditsearchwrapper .subredditsearch {\\n  position: absolute;\\n  left: 50%;\\n  top: 50%;\\n  transform: translate(-50%, -50%);\\n  display: grid;\\n}\\n.wrapper .hero .subredditsearchwrapper .subredditsearch .header {\\n  font-size: 20px;\\n  margin-bottom: 12px;\\n  text-align: center;\\n  color: white;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.input-container) {\\n  height: 40px;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.input-container input) {\\n  padding-left: 5px;\\n  padding-right: 5px;\\n  border: 2px solid rgba(255, 255, 255, 0.6);\\n  background-color: rgba(0, 0, 0, 0);\\n  color: white;\\n  border-radius: 3px;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.autocomplete-list) {\\n  max-height: calc(15 * (1rem + 10px) - 15px) !important;\\n  background-color: black;\\n  border: none;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.autocomplete-list .autocomplete-list-item) {\\n  color: white;\\n  background-color: black;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.autocomplete-list .autocomplete-list-item-create) {\\n  color: white;\\n  background-color: black;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.autocomplete-list .autocomplete-list-item.selected) {\\n  background-color: #f9ab0038;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.autocomplete-list .autocomplete-list-item b) {\\n  color: #f9ab00;\\n}\\n.wrapper .hero .image {\\n  height: 100vh;\\n  width: 100vw;\\n  background-size: contain;\\n  background-repeat: no-repeat;\\n  background-position: center;\\n}\\n.wrapper .hero .video {\\n  height: 100vh;\\n  width: 100vw;\\n  object-fit: contain;\\n}\\n.wrapper .prefetch {\\n  display: none;\\n}\\n@media (max-width: 1000px) {\\n  .wrapper .hero .goto {\\n    padding: 1rem 11rem 1rem 1rem;\\n  }\\n}\\n@media (max-width: 800px) {\\n  .wrapper .hero .goto {\\n    padding: 1rem;\\n  }\\n  .wrapper .hero .goto.tinygoto .nums {\\n    height: 0.1rem !important;\\n  }\\n  .wrapper .hero .goto img.small {\\n    display: none;\\n  }\\n}\\n\\n.tooltip {\\n  position: relative;\\n  z-index: 2;\\n  cursor: pointer;\\n}\\n\\n.ttbefore, .tooltip.bottom:before, .tooltip:before {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-bottom: 5px;\\n  margin-left: -30px;\\n  padding: 5px 4px;\\n  width: max-content;\\n  border-radius: 3px;\\n  background-color: black;\\n  color: #fff;\\n  background-color: rgba(255, 255, 255, 0.9);\\n  color: black;\\n  content: attr(data-tooltip);\\n  text-align: center;\\n  font-size: 0.8rem;\\n  line-height: 1.2;\\n}\\n\\n.ttafter, .tooltip.bottom:after, .tooltip:after {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-left: -5px;\\n  width: 0;\\n  border-top: 5px solid rgba(255, 255, 255, 0.9);\\n  border-right: 5px solid transparent;\\n  border-left: 5px solid transparent;\\n  content: \\\" \\\";\\n  font-size: 0;\\n  line-height: 0;\\n}\\n\\n.tooltip:before, .tooltip:after {\\n  visibility: hidden;\\n  opacity: 0;\\n  pointer-events: none;\\n}\\n.tooltip.bottom:before {\\n  bottom: -170%;\\n}\\n.tooltip.bottom:after {\\n  bottom: -40%;\\n  border-bottom: 5px solid rgba(255, 255, 255, 0.9);\\n  border-top: 5px solid transparent;\\n}\\n.tooltip:hover:before, .tooltip:hover:after {\\n  visibility: visible;\\n  opacity: 1;\\n}</style>\"],\"names\":[],\"mappings\":\"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\"}"
+	code: "html,body{margin:0;padding:0;box-sizing:border-box;overflow:hidden}.hide-cursor.svelte-1qdlkqz.svelte-1qdlkqz{cursor:none}.hide.svelte-1qdlkqz.svelte-1qdlkqz{display:none !important}.wrapper.svelte-1qdlkqz.svelte-1qdlkqz{height:100vh;display:grid;justify-items:center;align-items:center}.wrapper.svelte-1qdlkqz .hero.svelte-1qdlkqz{height:100vh;width:100vw;display:flex;flex-direction:column;justify-content:space-between;align-items:center}.wrapper.svelte-1qdlkqz .hero .title.svelte-1qdlkqz{z-index:10;position:absolute;left:1rem;top:1rem;background-color:rgba(26, 26, 26, 0.5);backdrop-filter:blur(20px);color:#fafafa;font-size:1.2rem;max-width:77%;padding:1rem 1.5rem;border-radius:12px;box-shadow:0 10px 30px rgba(0, 0, 0, 0.3)}.wrapper.svelte-1qdlkqz .hero .settings.svelte-1qdlkqz{z-index:10;position:absolute;top:1rem;right:1rem}.wrapper.svelte-1qdlkqz .hero .main-media-container.svelte-1qdlkqz{flex-grow:1;display:flex;justify-content:center;align-items:center;width:100%;height:100%}.wrapper.svelte-1qdlkqz .hero .main-media-container img.svelte-1qdlkqz,.wrapper.svelte-1qdlkqz .hero .main-media-container video.svelte-1qdlkqz{max-width:100%;max-height:100%;object-fit:contain}.wrapper.svelte-1qdlkqz .hero .goto.svelte-1qdlkqz{user-select:none;z-index:5;position:absolute;background-color:rgba(26, 26, 26, 0.5);backdrop-filter:blur(20px);bottom:0;display:grid;grid-row-gap:8px;padding:1.5rem 2rem;border-radius:12px;margin:1rem;color:#fafafa;width:calc(100% - 2rem);grid-template-columns:repeat(auto-fill, minmax(40px, 1fr));box-shadow:0 10px 30px rgba(0, 0, 0, 0.3)}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto.svelte-1qdlkqz{grid-template-rows:auto 1fr;grid-template-columns:1fr}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .btnwrapper.svelte-1qdlkqz{grid-template-columns:repeat(auto-fill, minmax(32px, 1fr));display:grid}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .numswrapper.svelte-1qdlkqz{grid-template-columns:repeat(auto-fit, minmax(1rem, auto));grid-auto-columns:max-content;display:grid;grid-gap:0.2rem}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .numswrapper .nums.svelte-1qdlkqz{border-bottom:3px solid rgba(255, 255, 255, 0.3);height:32px;cursor:pointer;border-radius:4px;transition:all 0.2s ease;display:flex;align-items:center;justify-content:center;min-width:40px}@media not all and (pointer: coarse){.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .numswrapper .nums.svelte-1qdlkqz:hover{border-bottom:3px solid #00b4d8 !important;background-color:rgba(255, 255, 255, 0.1)}}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .numswrapper .nums.currnum.svelte-1qdlkqz{border-bottom:3px solid #00b4d8 !important;background-color:rgba(0, 180, 216, 0.2)}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .numswrapper .nums.currnum.album.svelte-1qdlkqz{border-bottom:3px dotted #00b4d8 !important}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .numswrapper .nums.favorite.svelte-1qdlkqz{border-bottom:3px solid #fbbc04}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .numswrapper .nums.over18.svelte-1qdlkqz{border-bottom:3px solid #ea4335}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .numswrapper p.svelte-1qdlkqz{display:none}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .numswrapper .reload.svelte-1qdlkqz{grid-column:span 2}.wrapper.svelte-1qdlkqz .hero .goto .btnwrapper.svelte-1qdlkqz,.wrapper.svelte-1qdlkqz .hero .goto .numswrapper.svelte-1qdlkqz{display:contents}.wrapper.svelte-1qdlkqz .hero .goto .btnwrapper .reload.svelte-1qdlkqz{bottom:-1px}.wrapper.svelte-1qdlkqz .hero .goto .numswrapper .displayinfo.svelte-1qdlkqz{grid-column:span 1;font-size:0.9rem;margin-top:9px;color:rgba(255, 255, 255, 0.8)}.wrapper.svelte-1qdlkqz .hero .goto .numswrapper .displayinfo p.svelte-1qdlkqz{margin:0;text-align:center}.wrapper.svelte-1qdlkqz .hero .goto .btn.svelte-1qdlkqz{text-align:center;padding:8px;color:rgba(255, 255, 255, 0.6);cursor:pointer;border-radius:8px;transition:all 0.2s ease;display:flex;align-items:center;justify-content:center;min-width:40px;height:40px}@media not all and (pointer: coarse){.wrapper.svelte-1qdlkqz .hero .goto .btn.svelte-1qdlkqz:hover{color:white;background-color:rgba(255, 255, 255, 0.1)}}.wrapper.svelte-1qdlkqz .hero .goto .btn.reload.svelte-1qdlkqz{cursor:pointer}.wrapper.svelte-1qdlkqz .hero .goto .btn.reload.loaderror.svelte-1qdlkqz{color:#ea4335}.wrapper.svelte-1qdlkqz .hero .goto .btn.deepsearch.svelte-1qdlkqz{grid-column:span 4;cursor:pointer;justify-self:center;background-color:rgba(0, 180, 216, 0.1);border:1px solid rgba(0, 180, 216, 0.3)}.wrapper.svelte-1qdlkqz .hero .goto .btn.deepsearch.svelte-1qdlkqz:hover{background-color:rgba(0, 180, 216, 0.2);border-color:rgba(0, 180, 216, 0.5)}.wrapper.svelte-1qdlkqz .hero .goto .btn.deepsearch p.svelte-1qdlkqz{margin:0;font-size:0.9rem;color:#00b4d8;padding:0 1rem}.wrapper.svelte-1qdlkqz .hero .goto .btn.over18wrapper.over18 p.svelte-1qdlkqz{border:1px solid rgba(255, 255, 255, 0.3);color:rgba(255, 255, 255, 0.3)}@media not all and (pointer: coarse){.wrapper.svelte-1qdlkqz .hero .goto .btn.over18wrapper.over18 p.svelte-1qdlkqz:hover{border:1px solid rgba(255, 255, 255, 0.6);color:rgba(255, 255, 255, 0.6)}}.wrapper.svelte-1qdlkqz .hero .goto .btn.over18wrapper p.svelte-1qdlkqz{font-size:0.9rem;border:1px solid #ea4335;border-radius:3px;color:#ea4335;margin:0;width:58px;font-family:\"Roboto Condensed\", sans-serif;position:relative;top:-1px}.wrapper.svelte-1qdlkqz .hero .goto .btn.imagevideo.svelte-1qdlkqz{cursor:pointer;font-size:1.2rem;color:white}.wrapper.svelte-1qdlkqz .hero .goto .btn.muted.svelte-1qdlkqz{cursor:pointer;font-size:1.2rem;color:white}.wrapper.svelte-1qdlkqz .hero .goto .btn.filter.svelte-1qdlkqz{cursor:pointer;font-size:1.2rem;color:white}.wrapper.svelte-1qdlkqz .hero .goto .btn.filter input.svelte-1qdlkqz{background-color:rgba(42, 42, 42, 0.8);border:1px solid rgba(68, 68, 68, 0.8);color:white;padding:8px 12px;border-radius:6px;font-size:14px;outline:none;min-width:200px}.wrapper.svelte-1qdlkqz .hero .goto .btn.filter input.svelte-1qdlkqz:focus{border-color:#00b4d8;box-shadow:0 0 0 2px rgba(0, 180, 216, 0.2)}.wrapper.svelte-1qdlkqz .hero .goto .btn.cog.svelte-1qdlkqz{cursor:pointer;font-size:1.2rem;color:white;background-color:rgba(26, 26, 26, 0.95);backdrop-filter:blur(20px);border-radius:12px;transition:all 0.2s ease;box-shadow:0 10px 30px rgba(0, 0, 0, 0.3)}@media not all and (pointer: coarse){.wrapper.svelte-1qdlkqz .hero .goto .btn.cog.svelte-1qdlkqz:hover{background-color:rgba(34, 34, 34, 0.95);transform:scale(1.05)}}.wrapper.svelte-1qdlkqz .hero .goto .btn.dice.svelte-1qdlkqz{cursor:pointer;font-size:1.4rem;bottom:2px;color:white}.wrapper.svelte-1qdlkqz .hero .goto .btn.download.svelte-1qdlkqz{cursor:default;font-size:1.4rem;bottom:2px}.wrapper.svelte-1qdlkqz .hero .goto .btn.download.dlready.svelte-1qdlkqz{color:rgba(251, 188, 4, 0.9);cursor:pointer}@media not all and (pointer: coarse){.wrapper.svelte-1qdlkqz .hero .goto .btn.download.dlready.svelte-1qdlkqz:hover{color:#00b4d8}}.wrapper.svelte-1qdlkqz .hero .goto .btn.playpause.svelte-1qdlkqz{cursor:pointer;top:1px}.wrapper.svelte-1qdlkqz .hero .goto .btn.playpause.play.svelte-1qdlkqz{color:white}@media not all and (pointer: coarse){.wrapper.svelte-1qdlkqz .hero .goto .btn.playpause.svelte-1qdlkqz:hover{color:white}}.wrapper.svelte-1qdlkqz .hero .goto .btn.filter.svelte-1qdlkqz{cursor:pointer;top:1px}@media not all and (pointer: coarse){.wrapper.svelte-1qdlkqz .hero .goto .btn.filter.svelte-1qdlkqz:hover{color:white}}.wrapper.svelte-1qdlkqz .hero .goto .btn.filter.filter.filterExpanded.svelte-1qdlkqz{grid-column:span 3;top:-2px}.wrapper.svelte-1qdlkqz .hero .goto .btn.filter.filter.filterExpanded input.svelte-1qdlkqz{width:85%;margin-left:0px;padding-left:5px;padding-right:5px;border:1px solid rgba(255, 255, 255, 0.6);background-color:rgba(0, 0, 0, 0);color:white}.wrapper.svelte-1qdlkqz .hero .goto .nums.svelte-1qdlkqz{position:relative;height:40px;display:flex;align-items:center;justify-content:center;cursor:pointer;border-radius:4px;transition:all 0.2s ease;min-width:40px}.wrapper.svelte-1qdlkqz .hero .goto .nums.favorite p.small.svelte-1qdlkqz{border-bottom:3px solid #e37400 !important;color:#fbbc04}.wrapper.svelte-1qdlkqz .hero .goto .nums.favorite img.small.svelte-1qdlkqz{border-color:#e37400 !important}.wrapper.svelte-1qdlkqz .hero .goto .nums.over18 p.small.svelte-1qdlkqz{color:#ea4335;border-bottom:3px solid #ea4335}.wrapper.svelte-1qdlkqz .hero .goto .nums.over18 img.small.svelte-1qdlkqz{border-color:#ea4335}.wrapper.svelte-1qdlkqz .hero .goto .nums p.small.svelte-1qdlkqz{margin:0;text-align:center;cursor:pointer;border-bottom:3px solid rgba(0, 0, 0, 0)}.wrapper.svelte-1qdlkqz .hero .goto .nums p.small.curr.svelte-1qdlkqz{background-color:rgba(255, 255, 255, 0.2);border-bottom:3px solid white !important}.wrapper.svelte-1qdlkqz .hero .goto .nums p.small.curr.album.svelte-1qdlkqz{border-bottom:3px dashed white !important}.wrapper.svelte-1qdlkqz .hero .goto .nums img.small.svelte-1qdlkqz{z-index:10;width:0px;opacity:0;position:absolute;bottom:35px;border:2px solid white;background-color:rgb(76.5, 76.5, 76.5);min-width:100px;pointer-events:none;object-fit:cover}.wrapper.svelte-1qdlkqz .hero .goto .nums:hover p.small.svelte-1qdlkqz{background-color:rgba(255, 255, 255, 0.1);border-bottom:3px solid white !important}.wrapper.svelte-1qdlkqz .hero .goto .nums:hover img.svelte-1qdlkqz{width:auto;height:100px;opacity:1}.wrapper.svelte-1qdlkqz .hero .video.svelte-1qdlkqz{height:100vh;width:100vw;object-fit:contain}@media(max-width: 1000px){.wrapper.svelte-1qdlkqz .hero .goto.svelte-1qdlkqz{padding:1rem 11rem 1rem 1rem}}@media(max-width: 800px){.wrapper.svelte-1qdlkqz .hero .goto.svelte-1qdlkqz{padding:1rem}.wrapper.svelte-1qdlkqz .hero .goto.tinygoto .nums.svelte-1qdlkqz{height:0.1rem !important}.wrapper.svelte-1qdlkqz .hero .goto img.small.svelte-1qdlkqz{display:none}}.tooltip.svelte-1qdlkqz.svelte-1qdlkqz{position:relative;z-index:2;cursor:pointer}.tooltip.svelte-1qdlkqz.svelte-1qdlkqz:before{position:absolute;bottom:120%;left:50%;margin-bottom:5px;margin-left:-30px;padding:5px 4px;width:max-content;border-radius:3px;background-color:black;color:#fff;background-color:rgba(255, 255, 255, 0.9);color:black;content:attr(data-tooltip);text-align:center;font-size:0.8rem;line-height:1.2}.tooltip.svelte-1qdlkqz.svelte-1qdlkqz:after{position:absolute;bottom:120%;left:50%;margin-left:-5px;width:0;border-top:5px solid rgba(255, 255, 255, 0.9);border-right:5px solid transparent;border-left:5px solid transparent;content:\" \";font-size:0;line-height:0}.tooltip.svelte-1qdlkqz.svelte-1qdlkqz:before,.tooltip.svelte-1qdlkqz.svelte-1qdlkqz:after{visibility:hidden;opacity:0;pointer-events:none}.tooltip.svelte-1qdlkqz.svelte-1qdlkqz:hover:before,.tooltip.svelte-1qdlkqz.svelte-1qdlkqz:hover:after{visibility:visible;opacity:1}",
+	map: "{\"version\":3,\"file\":\"FullscreenLayout.svelte\",\"sources\":[\"FullscreenLayout.svelte\"],\"sourcesContent\":[\"<script>\\n  import Icon from \\\"fa-svelte/src/Icon.svelte\\\";\\n  import { faVolumeUp as faSoundOn } from \\\"@fortawesome/free-solid-svg-icons/faVolumeUp\\\";\\n  import { faVolumeMute as faSoundOff } from \\\"@fortawesome/free-solid-svg-icons/faVolumeMute\\\";\\n  import { faPlay } from \\\"@fortawesome/free-solid-svg-icons/faPlay\\\";\\n  import { faPause } from \\\"@fortawesome/free-solid-svg-icons/faPause\\\";\\n  import { faCog as faSettings } from \\\"@fortawesome/free-solid-svg-icons/faCog\\\";\\n  import { faHome } from \\\"@fortawesome/free-solid-svg-icons/faHome\\\";\\n  import { faDonate } from \\\"@fortawesome/free-solid-svg-icons/faDonate\\\";\\n  import { faExpandAlt as faExpand } from \\\"@fortawesome/free-solid-svg-icons/faExpandAlt\\\";\\n  import { faCloudDownloadAlt as faDownload } from \\\"@fortawesome/free-solid-svg-icons/faCloudDownloadAlt\\\";\\n  import { faDice } from \\\"@fortawesome/free-solid-svg-icons/faDice\\\";\\n  import { faPhotoVideo as faImageVideo } from \\\"@fortawesome/free-solid-svg-icons/faPhotoVideo\\\";\\n  import { faVideo } from \\\"@fortawesome/free-solid-svg-icons/faVideo\\\";\\n  import { faImage } from \\\"@fortawesome/free-solid-svg-icons/faImage\\\";\\n  import { faSearch } from \\\"@fortawesome/free-solid-svg-icons/faSearch\\\";\\n  import { faSync } from \\\"@fortawesome/free-solid-svg-icons/faSync\\\";\\n  import { faSpinner } from \\\"@fortawesome/free-solid-svg-icons/faSpinner\\\";\\n\\n  // AutoComplete import removed - not used\\n\\n  import Settings from \\\"./Settings.svelte\\\";\\n\\n  import { onMount, tick } from \\\"svelte\\\";\\n  import { goto as ahref } from \\\"@sapper/app\\\";\\n\\n  import shuffle from \\\"lodash.shuffle\\\";\\n\\n  import { API_KEY } from \\\"../config.js\\\";\\n  import { get_tumblr_posts, queryp } from \\\"../_tumblr_utils.ts\\\";\\n\\n  \\n\\n  import { writable, throttle, startWith } from \\\"svelte-pipeable-store\\\";\\n\\n  import {\\n    autoplay,\\n    autoplayinterval,\\n    imageVideo,\\n    portraitLandscape,\\n    favorite,\\n    over18,\\n    prefetch,\\n    prefetchNum,\\n    hires,\\n    lores,\\n    muted,\\n    layout,\\n    multireddit,\\n    oldreddit,\\n    hideUIonStart,\\n    apiKey\\n  } from \\\"../_prefs\\\";\\n  autoplay.useLocalStorage(false);\\n  autoplayinterval.useLocalStorage(3);\\n  imageVideo.useLocalStorage(0);\\n  portraitLandscape.useLocalStorage(0);\\n  favorite.useLocalStorage({});\\n  over18.useLocalStorage(1);\\n  multireddit.useLocalStorage({});\\n  prefetch.useLocalStorage(true);\\n  prefetchNum.useLocalStorage(50);\\n  hires.useLocalStorage(false);\\n  lores.useLocalStorage(true);\\n  oldreddit.useLocalStorage(false);\\n  muted.useLocalStorage(true);\\n  layout.useLocalStorage(0);\\n  hideUIonStart.useLocalStorage(false);\\n  apiKey.useLocalStorage('');\\n\\n  export let params, slugstr;\\n  export let posts = [];\\n  export let after = null;\\n  export let res;\\n  export let mode = \\\"tumblr\\\";\\n  export let pageType = \\\"user\\\";\\n\\n  console.log(\\\"Posts from API:\\\", posts);\\n\\n  let data;\\n  let displayposts = [];\\n  console.log(\\\"Display Posts (initial):\\\", displayposts);\\n  let uiVisible = !$hideUIonStart;\\n  let hideCursor = $hideUIonStart;\\n  let hideCursorTimerId = 0;\\n  let titleVisible = true;\\n  let numFavorite;\\n  let tinygoto;\\n  let title;\\n  let albumindex = 0;\\n\\n  $: {\\n    if (currpost.is_album) {\\n      title = `(${albumindex + 1}/${currpost.preview.img.album.length}) ${\\n        currpost.title\\n      }`;\\n    } else {\\n      title = currpost.title;\\n    }\\n  }\\n\\n  let blogIdentifier;\\n\\n  $: blogIdentifier = slugstr;\\n\\n  $: {\\n    if ($gotoElWidth > 1000) {\\n      // padding on both sides\\n      let numGotoControlsInOneRow = ($gotoElWidth - 154 * 2) / 32;\\n      let numGotoControlsRows =\\n        (displayposts.length + 5) / numGotoControlsInOneRow;\\n      tinygoto = numGotoControlsRows > 3;\\n    } else if ($gotoElWidth > 800) {\\n      // padding on right side\\n      let numGotoControlsInOneRow = ($gotoElWidth - (154 + 14)) / 32;\\n      let numGotoControlsRows =\\n        (displayposts.length + 5) / numGotoControlsInOneRow;\\n      tinygoto = numGotoControlsRows > 3;\\n    } else {\\n      // no padding\\n      let numGotoControlsInOneRow = ($gotoElWidth - (14 + 14)) / 32;\\n      let numGotoControlsRows =\\n        (displayposts.length + 5) / numGotoControlsInOneRow;\\n      tinygoto = numGotoControlsRows > 3;\\n    }\\n  }\\n\\n  // 1440 is to set numCols to 3. Setting to `0` would mean we start with 1 col, and then quickly update to 3 on desktop.\\n  const _gotoElWidth = writable(1440);\\n  const gotoElWidth = _gotoElWidth.pipe(throttle(500), startWith(1440));\\n\\n  $: loadError = res && !res.res.ok;\\n  let loading = false;\\n  let reloadstr = \\\"Load more\\\";\\n  let navigation = false;\\n\\n  let imageVideoStr = \\\"\\\";\\n  let portraitLandscapeStr = \\\"\\\";\\n  let downloadstr = \\\"\\\";\\n  let autoplaystr = \\\"\\\";\\n  let over18str = \\\"\\\";\\n  let deepsearchstr = \\\"\\\"; // Declare deepsearchstr\\n  \\n  let showhidestr = \\\"Show (h)\\\";\\n  let mutedstr = \\\"Sound Off\\\";\\n\\n  let autoplaytimer;\\n\\n  let filterRef;\\n  let filterExpanded = false;\\n  let filterValue = \\\"\\\";\\n  let subredditSearchValue = \\\"\\\"; // Declare subredditSearchValue\\n\\n  let showSettings = false;\\n\\n  let currpost = { title: \\\"Loading ..\\\" };\\n  let nexturls = [];\\n\\n  let index = 0;\\n\\n  async function loadMore() {\\n    if (loading) return;\\n\\n    loading = true;\\n    reloadstr = \\\"Loading ..\\\";\\n\\n    let newposts;\\n\\n    if (mode === \\\"tumblr\\\") {\\n      let useApiKey = $apiKey || API_KEY;\\n      let url;\\n      if (pageType === 'search') {\\n        url = `https://api.tumblr.com/v2/tagged?tag=${blogIdentifier}&api_key=${useApiKey}&before=${after || ''}&${queryp(params)}`;\\n      } else {\\n        url = `https://api.tumblr.com/v2/blog/${blogIdentifier}/posts?api_key=${useApiKey}&offset=${after || ''}&${queryp(params)}`;\\n      }\\n\\n      ({\\n        posts: newposts,\\n        after,\\n        ...res\\n      } = await get_tumblr_posts(url));\\n    }\\n\\n    console.log(\\\"[loadMore] API Response (res object):\\\", res);\\n    console.log(\\\"[loadMore] New posts received:\\\", newposts.length);\\n    console.log(\\\"[loadMore] Current posts array before combining:\\\", posts.length);\\n\\n    // load `favorite` from localstorage\\n    for (let p of newposts) {\\n      p[\\\"favorite\\\"] = !!(($favorite || {})[p.url]?.favorite);\\n    }\\n\\n    // Combine `posts` and `newposts` and remove duplicates from multiple network requests\\n    posts = [...posts, ...newposts].reduce(\\n      (r, i) => (!r.some((j) => i.id === j.id) ? [...r, i] : r),\\n      []\\n    );\\n    console.log(\\\"[loadMore] Posts after initial combine (before URL dedupe): \\\", posts.length);\\n\\n    // Remove duplicates, based on `url`\\n    posts = posts.filter((v, i, a) => a.findIndex((t) => t.url == v.url) === i);\\n\\n    console.log(\\\"[loadMore] After dedupe/Total loaded: \\\", posts.length);\\n    console.log(\\\"[loadMore] Next 'after' value:\\\", after);\\n\\n    loading = false;\\n    reloadstr = \\\"Load more\\\";\\n  }\\n\\n  onMount(async () => {\\n    // Always try to load data on mount, regardless of API key status\\n    loadMore();\\n    // Start autoplay by default\\n    if ($autoplay) {\\n      startAutoPlay();\\n    }\\n  });\\n\\n  function startAutoPlay() {\\n    //console.log('START')\\n    autoplaytimer = setInterval(() => {\\n      // If `autoplay` is off and it is a video, the video will progress by itself via on:ended\\n      if ($autoplay && currpost.is_image) {\\n        //console.log('---- iNEXT')\\n        next();\\n      } else if (!$autoplay && currpost.is_video) {\\n        //console.log('---- vNEXT')\\n        next();\\n      }\\n    }, $autoplayinterval * 1000);\\n\\n    autoplay.set(true);\\n  }\\n\\n  async function prev() {\\n    if (currpost.is_album && albumindex > 0) {\\n      albumPrev();\\n    } else {\\n      itemPrev();\\n      await tick(); // Ensure currpost is updated\\n      if (currpost.is_album) {\\n        albumindex = currpost.preview.img.album.length - 1;\\n      }\\n    }\\n  }\\n\\n  async function next() {\\n    if (currpost.is_album && !isEndOfAlbum()) {\\n      albumNext();\\n    } else {\\n      itemNext();\\n      await tick(); // Ensure currpost is updated\\n    }\\n  }\\n\\n  function stopAutoPlay() {\\n    //console.log('STOP')\\n    clearInterval(autoplaytimer);\\n    autoplay.set(false);\\n  }\\n\\n  function stopAndStartAutoPlay() {\\n    stopAutoPlay();\\n\\n    startAutoPlay();\\n  }\\n\\n  function toggleAutoPlay() {\\n    if ($autoplay) {\\n      stopAutoPlay();\\n    } else {\\n      startAutoPlay();\\n    }\\n  }\\n\\n  function toggleImageVideo() {\\n    $imageVideo = $imageVideo + 1;\\n\\n    if ($imageVideo == 3) {\\n      $imageVideo = 0;\\n    }\\n  }\\n\\n  function uniqBy(a, key) {\\n    var seen = {};\\n    return a.filter(function(item) {\\n        var k = key(item);\\n        return seen.hasOwnProperty(k) ? false : (seen[k] = true);\\n    });\\n  }\\n\\n  function toggleMuted() {\\n    $muted = !$muted;\\n  }\\n\\n  function togglePortraitLandscape() {\\n    $portraitLandscape = $portraitLandscape + 1;\\n\\n    if ($portraitLandscape == 3) {\\n      $portraitLandscape = 0;\\n    }\\n  }\\n\\n  let renderVideo = true;\\n\\n  // Some operations like fav/unfav causes video to re-render\\n  // since we're changing post.favorite. This should help skip it\\n  let skipRenderVideo = false;\\n\\n  $: {\\n    if (!skipRenderVideo) reMountVideo(currpost.preview);\\n    skipRenderVideo = false;\\n  }\\n\\n  function reMountVideo() {\\n    renderVideo = false;\\n    setTimeout(() => (renderVideo = true), 0);\\n  }\\n\\n  $: {\\n    // Subreddit search\\n    if (subredditSearchValue) {\\n      //subredditSearchVisible = false;\\n      //ahref(`/r/${subredditSearchValue}`);\\n      //subredditSearchValue = \\\"\\\";\\n      //subredditSearchValueRaw = \\\"\\\";\\n      jumpToSubReddit(subredditSearchValue);\\n    }\\n  }\\n\\n  $: {\\n    numFavorite = displayposts.filter((item) => item.favorite == true).length;\\n\\n    if (!numFavorite) {\\n      downloadstr = `Nothing to download`;\\n    } else if (numFavorite == 1) {\\n      downloadstr = `Download ${numFavorite} file`;\\n    } else {\\n      downloadstr = `Download ${numFavorite} files`;\\n    }\\n    autoplaystr = `Autoplay is ${$autoplay ? \\\"on\\\" : \\\"off\\\"}`;\\n    deepsearchstr = `Search for ${filterValue}`;\\n\\n    mutedstr = `Sound ${$muted ? \\\"off\\\" : \\\"on\\\"}`;\\n\\n    if ($over18 == 0) {\\n      over18str = \\\"nsfw off\\\";\\n    } else if ($over18 == 1) {\\n      over18str = \\\"nsfw on\\\";\\n    } else if ($over18 == 2) {\\n      over18str = \\\"nsfw only\\\";\\n    }\\n\\n    if ($imageVideo == 0) {\\n      imageVideoStr = \\\"Show both image and video\\\";\\n    } else if ($imageVideo == 1) {\\n      imageVideoStr = \\\"Show videos only\\\";\\n    } else if ($imageVideo == 2) {\\n      imageVideoStr = \\\"Show images only\\\";\\n    }\\n\\n    if ($portraitLandscape == 0) {\\n      portraitLandscapeStr = \\\"Show all media\\\";\\n    } else if ($portraitLandscape == 1) {\\n      portraitLandscapeStr = \\\"Show only portrait media\\\";\\n    } else if ($portraitLandscape == 2) {\\n      portraitLandscapeStr = \\\"Show only landscape media\\\";\\n    }\\n  }\\n\\n  $: {\\n    if (displayposts[index]) {\\n      currpost = JSON.parse(JSON.stringify(displayposts[index]));\\n\\n      let _nexturls = [];\\n\\n      _nexturls = [\\n        currpost,\\n        ...displayposts.slice(index + 1, index + $prefetchNum + 1)\\n      ];\\n\\n      nexturls = _nexturls\\n        .map(function (item) {\\n          if (item.is_album) {\\n            return item.preview.img.album.slice(\\n              albumindex,\\n              albumindex + $prefetchNum + 1\\n            );\\n          } else {\\n            return item;\\n          }\\n        })\\n        .flat();\\n\\n      console.log(nexturls);\\n      nexturls = uniqBy(nexturls, () => (item) => item.preview.img.default);\\n    } else if (filterValue) {\\n      // We're here because user filtered the list\\n\\n      // Unfortunately the filtered list is smaller than the current index\\n      // set index to last item\\n      if (displayposts.length > 0) {\\n        console.log(\\\"setting index from \\\", index, \\\" to \\\", displayposts.length);\\n        index = displayposts.length - 1;\\n        console.log(\\\"loading more ..\\\");\\n        loadMore();\\n      } else {\\n        // nothing was filtered\\n        index = 0;\\n        currpost = {\\n          title: \\\"Nothing to show. Try changing filters or tweak/update URL.\\\"\\n        };\\n      }\\n    } else {\\n      if (res && res.res.ok) {\\n        // No media found\\n        currpost = {\\n          title: \\\"Nothing to show. Try changing filters or tweak/update URL.\\\"\\n        };\\n      } else if (res && !res.res.ok) {\\n        // Check if it's an API key error\\n        console.log(\\\"API Error Response:\\\", res);\\n        \\n        // Handle API errors with helpful messaging\\n        const errorMessage = res.res.res || res.res || \\\"\\\";\\n        \\n        // Check if it's an API key error\\n        const isApiKeyError = errorMessage.includes(\\\"Invalid API key\\\") || \\n                             errorMessage.includes(\\\"OAuth Consumer Key Goes Here\\\") ||\\n                             errorMessage.includes(\\\"api_key\\\") ||\\n                             (API_KEY === 'OAuth Consumer Key Goes Here' && !$apiKey);\\n        \\n        if (isApiKeyError) {\\n          currpost = { title: \\\"Please set your Tumblr API key in settings\\\" };\\n          // Optionally show settings, but don't force it\\n          // showSettings = true; // Uncomment this line if you want settings to open automatically\\n        } else {\\n          currpost = { title: \\\"Error loading posts\\\" };\\n        }\\n      } else {\\n        // Default\\n        currpost = { title: \\\"Loading ..\\\" };\\n      }\\n\\n      nexturls = [];\\n    }\\n  }\\n\\n  $: {\\n    let tmp = [];\\n\\n    if ($over18 == 0) {\\n      tmp = posts.filter((item) => item.over18 == false);\\n    } else if ($over18 == 1) {\\n      tmp = posts;\\n    } else if ($over18 == 2) {\\n      tmp = posts.filter((item) => item.over18 == true);\\n    }\\n\\n    if (filterValue) {\\n      skipRenderVideo = true;\\n      tmp = tmp.filter((item) =>\\n        item.title.toLowerCase().includes(filterValue.toLowerCase())\\n      );\\n    }\\n\\n    // Filter only videos\\n    if ($imageVideo == 1) {\\n      tmp = tmp.filter((item) => item.is_video);\\n    }\\n    // Filter only images\\n    else if ($imageVideo == 2) {\\n      tmp = tmp.filter((item) => item.is_image);\\n    }\\n\\n    if ($portraitLandscape == 1) {\\n      tmp = tmp.filter((item) => item.dims.width / item.dims.height <= 1.2);\\n    } else if ($portraitLandscape == 2) {\\n      tmp = tmp.filter((item) => item.dims.width / item.dims.height > 1.2);\\n    }\\n\\n    displayposts = tmp;\\n  }\\n\\n  // API key changes are handled manually by the user\\n  // No automatic reloading or settings popup\\n\\n  // Only show settings if we have no valid API key AND no posts loaded\\n  // Settings window will only appear when user manually clicks the settings button\\n  // No automatic popup on refresh or load\\n\\n  function goto(i) {\\n    albumindex = 0;\\n    index = i;\\n\\n    let itemNum = displayposts.length - index;\\n\\n    // If autoplay is on and we're jumping to 2 or 3, we must load\\n    if ((itemNum == 2 || itemNum == 3) && $autoplay) {\\n      console.log(\\\"[goto-to-2/3]: loading ..\\\");\\n      loadMore();\\n    }\\n\\n    // Last item\\n    if (itemNum === 1) {\\n      console.log(\\\"[goto-to-lastitem]: loading ..\\\");\\n      loadMore();\\n    }\\n\\n    if ($autoplay) stopAndStartAutoPlay();\\n  }\\n\\n  function reloadData() {\\n    // Always reload data, let the API handle errors\\n    posts = [];\\n    displayposts = [];\\n    after = null;\\n    loadMore();\\n  }\\n\\n  function videoended() {\\n    itemNext();\\n  }\\n\\n  function itemNext() {\\n    albumindex = 0; // Always reset album index to 0 when moving to a new post\\n    let itemNum = displayposts.length - 1 - index;\\n\\n    // Last item, dont go past the last item\\n    if (itemNum <= 1) {\\n      index = displayposts.length - 1;\\n\\n      console.log(\\\"[lastitem, autoplay+filter?]: loading more ..\\\");\\n      // Reached last item, possibly by autoplay + filter\\n      loadMore();\\n\\n      return;\\n    }\\n\\n    // Auto trigger on the last 4th item\\n    if (itemNum === 4 || itemNum === 3) {\\n      console.log(\\\"[4th last item, normal]: loading more ..\\\");\\n      loadMore();\\n    }\\n\\n    // If we're at 3rd/2nd last item with a filter, the user\\n    // possibly just filtered the list and ended up here.\\n    // trigger a load more. We dont want to do it always since\\n    // we normally trigger loadmore @3rd last item. Always doing it\\n    // Would end up with 2 requests to reddit.com\\n    if (itemNum === 2 && filterValue) {\\n      console.log(\\\"[2nd last item, filtering?]: loading more ..\\\");\\n      loadMore();\\n    }\\n\\n    index += 1;\\n\\n    if ($autoplay) stopAndStartAutoPlay();\\n  }\\n\\n  async function itemPrev() {\\n    if (index === 0) return;\\n    index -= 1;\\n\\n    albumindex = 0; // Always reset album index to 0 when moving to a new post\\n\\n    await tick(); // Ensure currpost is updated before accessing its properties\\n\\n    if (displayposts.length - index === 3) {\\n      loadMore();\\n    }\\n    if ($autoplay) stopAndStartAutoPlay();\\n  }\\n\\n  function toggleFullscreen() {\\n    var elem = document.body;\\n    if (\\n      document.fullscreenElement || // alternative standard method\\n      document.mozFullScreenElement ||\\n      document.webkitFullscreenElement ||\\n      document.msFullscreenElement\\n    ) {\\n      // current working methods\\n      if (document.exitFullscreen) {\\n        document.exitFullscreen();\\n      } else if (document.msExitFullscreen) {\\n        document.msExitFullscreen();\\n      } else if (document.mozCancelFullScreen) {\\n        document.mozCancelFullScreen();\\n      } else if (document.webkitExitFullscreen) {\\n        document.webkitExitFullscreen();\\n      }\\n      if (!uiVisible) {\\n        toggleUIVisiblity();\\n      }\\n    } else {\\n      if (elem.requestFullscreen) {\\n        elem.requestFullscreen();\\n      } else if (elem.msRequestFullscreen) {\\n        elem.msRequestFullscreen();\\n      } else if (elem.mozRequestFullScreen) {\\n        elem.mozRequestFullScreen();\\n      } else if (elem.webkitRequestFullscreen) {\\n        elem.webkitRequestFullscreen();\\n      }\\n      if (uiVisible) {\\n        toggleUIVisiblity();\\n      }\\n    }\\n  }\\n\\n  function onVideoPlayerClicked(ev) {\\n    const r = document.getElementById('videoplayerid').getBoundingClientRect();\\n    const x = ev.offsetX / r.width;\\n    const activePart = 1/5;\\n\\n    if (x < activePart) {\\n      itemPrev();\\n    } else if (x > (1-activePart)) {\\n      itemNext();\\n    }\\n  }\\n\\n  function toggleHideCursor() {\\n    // If the UI is currently visible, the cursor should always be visible.\\n    // We don't want to set a timer to hide it in this state.\\n    if (uiVisible) {\\n      hideCursor = false; // Ensure cursor is visible\\n      if (hideCursorTimerId) {\\n        clearTimeout(hideCursorTimerId); // Clear any lingering timer\\n        hideCursorTimerId = 0;\\n      }\\n      return; // Stop here, no further action needed\\n    }\\n\\n    // If the UI is hidden, we manage cursor visibility based on inactivity.\\n    hideCursor = false; // Show cursor immediately on mouse movement\\n    if (hideCursorTimerId) {\\n      clearTimeout(hideCursorTimerId); // Clear previous timer\\n    }\\n    hideCursorTimerId = setTimeout(() => {\\n      hideCursorTimerId = 0;\\n      hideCursor = true; // Hide cursor after 3 seconds of inactivity\\n    }, 3000);\\n  }\\n\\n  function toggleTitleVisibility() {\\n    titleVisible = !titleVisible;\\n  }\\n\\n  function toggleUIVisiblity() {\\n    uiVisible = !uiVisible;\\n\\n    showhidestr = uiVisible ? \\\"Hide (h)\\\" : \\\"Show (h)\\\";\\n\\n    if (hideCursorTimerId) {\\n      clearTimeout(hideCursorTimerId);\\n      hideCursorTimerId = 0;\\n    }\\n\\n    if (!uiVisible) {\\n      hideCursor = true;\\n    } else {\\n      hideCursor = false;\\n    }\\n  }\\n\\n  function toggleSettings() {\\n    showSettings = !showSettings;\\n  }\\n\\n  function gotoDeepSearch() {\\n    let prefix = \\\"\\\";\\n    if (slugstr) {\\n      prefix = `/r/${subreddit}`;\\n    } else {\\n      prefix = ``;\\n    }\\n\\n    navigation = true;\\n    ahref(\\n      `${prefix}/search?q=${filterValue}&restrict_sr=on&include_over_18=on&sort=relevant&t=all`\\n    );\\n  }\\n\\n  function hideSettings() {\\n    showSettings = false;\\n  }\\n\\n  \\n\\n  async function expandFilter() {\\n    filterExpanded = true;\\n\\n    await tick();\\n\\n    // Focus the input if we just opened it\\n    if (filterExpanded) filterRef.querySelector(\\\"input\\\").focus();\\n  }\\n\\n  async function toggleFilter() {\\n    filterExpanded = !filterExpanded;\\n\\n    await tick();\\n    // Focus the input if we just opened it\\n    if (filterExpanded) filterRef.querySelector(\\\"input\\\").focus();\\n  }\\n\\n  async function downloadFiles() {\\n    window.open(\\\"/download\\\", \\\"_blank\\\");\\n  }\\n\\n  async function shuffleFiles() {\\n    displayposts = shuffle(displayposts);\\n  }\\n\\n  function openMedia() {\\n    window.open(currpost.permalink, \\\"_blank\\\");\\n  }\\n\\n  \\n\\n  function copySrcToClipboard() {\\n    let text;\\n    if (\\n      currpost.url.startsWith(\\\"https://v.redd.it/\\\") ||\\n      currpost.url.includes(\\\"redgifs.com\\\")\\n    ) {\\n      text = currpost.preview.vid.mp4;\\n    } else if (currpost.is_image && !currpost.is_album) {\\n      text = currpost.url;\\n    } else if (currpost.is_video) {\\n      text = currpost.url;\\n    } else if (currpost.is_album) {\\n      if (currpost.preview.img.album[albumindex].is_video) {\\n        text = currpost.preview.img.album[albumindex].hires;\\n      } else {\\n        text = currpost.preview.img.album[albumindex].hires;\\n      }\\n    }\\n\\n    navigator.clipboard\\n      .writeText(text)\\n      .then(() => console.log(`Copied: ${text}`));\\n  }\\n\\n  function toggleOver18() {\\n    $over18 = $over18 + 1;\\n\\n    if ($over18 == 3) {\\n      $over18 = 0;\\n    }\\n    over18.set($over18);\\n  }\\n\\n  function removeAllFavorite(removeAllFromLocalStorage) {\\n    skipRenderVideo = true;\\n\\n    for (const [i, post] of displayposts.entries()) {\\n      // For reactivity\\n      displayposts[i].favorite = false;\\n\\n      // If removeAllFromLocalStorage is true, then we'll remove everythign in one shot\\n      // no need to do it one by one\\n      if (removeAllFromLocalStorage == false) {\\n        // Localstorage\\n        $favorite[post.url] = undefined;\\n        $favorite = JSON.parse(JSON.stringify($favorite));\\n\\n        favorite.set($favorite);\\n      }\\n    }\\n\\n    if (removeAllFromLocalStorage) {\\n      favorite.set({});\\n    }\\n  }\\n  function toggleFavorite() {\\n    skipRenderVideo = true;\\n    displayposts[index].favorite = !displayposts[index].favorite;\\n\\n    let url = displayposts[index].url;\\n    $favorite[url] = undefined;\\n    $favorite = JSON.parse(JSON.stringify($favorite));\\n    $favorite[url] = displayposts[index];\\n    favorite.set($favorite);\\n  }\\n\\n  function albumPrev() {\\n    if (!currpost.is_album) return;\\n    albumindex -= 1;\\n    if ($autoplay) stopAndStartAutoPlay();\\n  }\\n\\n  function isEndOfAlbum() {\\n    return albumindex == currpost.preview.img.album.length - 1;\\n  }\\n\\n  function isStartOfAlbum() {\\n    return albumindex == 0;\\n  }\\n\\n  function albumNext() {\\n    if (!currpost.is_album) return;\\n\\n    if (isEndOfAlbum()) {\\n      albumindex = 0;\\n    } else {\\n      albumindex += 1;\\n    }\\n\\n    if ($autoplay) stopAndStartAutoPlay();\\n  }\\n\\n  function wheel(event) {\\n    if (event.deltaY > 0) {\\n      next();\\n    } else if (event.deltaY < 0) {\\n      prev();\\n    }\\n  }\\n\\n  function keydown(event) {\\n    // up\\n    if (event.keyCode == 38) {\\n      next();\\n    }\\n\\n    // down\\n    if (event.keyCode == 40) {\\n      prev();\\n    }\\n\\n    // s\\n    if (event.keyCode == 83) {\\n      toggleMuted();\\n    }\\n\\n    // q, p\\n    if (event.keyCode == 81 || event.keyCode == 80) {\\n      toggleAutoPlay();\\n    }\\n\\n    // f\\n    if (event.keyCode == 70 && !event.ctrlKey) {\\n      toggleFullscreen();\\n    }\\n\\n    // slash, f\\n    if (event.keyCode == 191) {\\n      expandFilter();\\n      // We need this, otherwise filter box will have '/' because of autofocus\\n      event.preventDefault();\\n    }\\n\\n    // x\\n    if (event.keyCode == 88) {\\n      if (event.shiftKey) {\\n        removeAllFavorite(event.ctrlKey); // if ctrl+shift+x is remove everything from localstorage\\n      } else {\\n        toggleFavorite();\\n      }\\n    }\\n\\n    if (event.ctrlKey) {\\n      return;\\n    }\\n\\n    // o\\n    if (event.keyCode == 79) {\\n      openMedia();\\n    }\\n\\n    // i\\n    if (event.keyCode == 73) {\\n      openMedia();\\n    }\\n\\n    // o\\n    if (event.keyCode == 79) {\\n      window.open(currpost.permalink, \\\"_blank\\\");\\n    }\\n\\n    // h\\n    if (event.keyCode == 72) {\\n      toggleUIVisiblity();\\n    }\\n\\n    // t\\n    if (event.keyCode == 84) {\\n      toggleTitleVisibility();\\n    }\\n\\n    // v\\n    if (event.keyCode == 118) {\\n      toggleImageVideo();\\n    }\\n\\n    // c\\n    if (event.keyCode == 67) {\\n      copySrcToClipboard();\\n    }\\n\\n    const n = event.keyCode - 48;\\n    if (n >= 0 && n <= 3) {\\n      const video = document.getElementById('videoplayerid');\\n      video.currentTime = n * video.duration / 4;\\n    }\\n\\n    // Left Arrow, a, k, Page-up\\n    if (\\n      event.keyCode == 37 ||\\n      event.keyCode == 65 ||\\n      event.keyCode == 75 ||\\n      event.keyCode == 33\\n    ) {\\n      if (event.shiftKey) {\\n        const video = document.getElementById('videoplayerid');\\n        video.currentTime -= 5;\\n      } else {\\n        itemPrev();\\n      }\\n    }\\n    // Right Arrow, d, j, Space, Page-down\\n    else if (\\n      event.keyCode == 39 ||\\n      event.keyCode == 68 ||\\n      event.keyCode == 74 ||\\n      event.keyCode == 32 ||\\n      event.keyCode == 34\\n    ) {\\n      if (event.shiftKey) {\\n        const video = document.getElementById('videoplayerid');\\n        video.currentTime += 5;\\n      } else {\\n        itemNext();\\n      }\\n    }\\n  }\\n</script>\\n\\n<svelte:window on:keydown={keydown} on:wheel={wheel} />\\n<svelte:head>\\n  <title>tumblrpx - {slugstr ? `t/${slugstr}` : \\\"tumblr.com\\\"}</title>\\n</svelte:head>\\n\\n<div class=\\\"wrapper\\\" class:hide-cursor=\\\"{hideCursor}\\\">\\n  <div class=\\\"hero\\\">\\n    <div class=\\\"title\\\" class:hide=\\\"{!uiVisible || !titleVisible}\\\" class:favorite=\\\"{currpost.favorite}\\\">\\n      {#if currpost.dims && currpost.dims.width > 0}\\n        {title} ({currpost.dims.width}x{currpost.dims.height})\\n      {:else}\\n        {title}\\n      {/if}\\n      {#if currpost.subreddit}\\n        <div class=\\\"subreddit\\\">\\n          <p class=\\\"user\\\">{currpost.authorp}</p>\\n        </div>\\n      {/if}\\n    </div>\\n    <div class=\\\"settings\\\">\\n      \\n      <span class=\\\"btn cog\\\" on:click=\\\"{toggleSettings}\\\" class:showSettings=\\\"{showSettings}\\\" class:hide=\\\"{uiVisible == false}\\\">\\n        <Icon icon=\\\"{faSettings}\\\"></Icon>\\n      </span>\\n      <div class=\\\"div\\\" class:hide=\\\"{uiVisible == false}\\\">\\n        <Settings bind:showSettings on:apiKeyChange={reloadData}></Settings>\\n      </div>\\n    </div>\\n    <div class=\\\"main-media-container\\\">\\n      {#if currpost.is_image && !currpost.is_album}\\n        <img src=\\\"{currpost.preview.img.default}\\\" alt=\\\"{currpost.title}\\\" style=\\\"height: 100vh; object-fit: contain;\\\">\\n      {:else if currpost.is_video && renderVideo}\\n        <video class=\\\"video\\\" autoplay loop=\\\"{!$autoplay}\\\" playsinline muted=\\\"{$muted}\\\" on:ended=\\\"{videoended}\\\" on:dblclick=\\\"{toggleFullscreen}\\\" class:hide-cursor=\\\"{hideCursor}\\\" on:mousemove=\\\"{toggleHideCursor}\\\" id=\\\"videoplayerid\\\" on:click=\\\"{onVideoPlayerClicked}\\\">\\n          {#if $lores}\\n            <source src=\\\"{currpost.preview.vid.lores}\\\">\\n          {:else}\\n            {#if currpost.preview.vid.webm}\\n              <source src=\\\"{currpost.preview.vid.webm}\\\">\\n            {/if}\\n            {#if currpost.preview.vid.mp4}\\n              <source src=\\\"{currpost.preview.vid.mp4}\\\">\\n            {/if}\\n          {/if}\\n        </video>\\n      {:else if currpost.is_album}\\n        {#if currpost.preview.img.album[albumindex].is_video}\\n          <video class=\\\"video\\\" autoplay loop=\\\"{!$autoplay}\\\" playsinline muted=\\\"{$muted}\\\" on:ended=\\\"{videoended}\\\" on:dblclick=\\\"{toggleFullscreen}\\\" class:hide-cursor=\\\"{hideCursor}\\\" on:mousemove=\\\"{toggleHideCursor}\\\" on:click=\\\"{onVideoPlayerClicked}\\\">\\n            <source src=\\\"{currpost.preview.img.album[albumindex].hires}\\\">\\n          </video>\\n        {:else}\\n          <img src=\\\"{currpost.preview.img.album[albumindex].default}\\\" alt=\\\"{currpost.title}\\\" style=\\\"height: 100vh; object-fit: contain;\\\">\\n        {/if}\\n      {/if}\\n    </div>\\n    \\n    {#if displayposts.length || posts.length}\\n      <div class=\\\"goto\\\" class:tinygoto=\\\"{tinygoto}\\\" class:hide=\\\"{uiVisible == false}\\\" bind:clientWidth=\\\"{$_gotoElWidth}\\\">\\n        <div class=\\\"btnwrapper\\\">\\n          <span class=\\\"btn playpause tooltip\\\"\\n            data-tooltip=\\\"{autoplaystr}\\\"\\n            class:play=\\\"{$autoplay}\\\"\\n            on:click=\\\"{toggleAutoPlay}\\\"\\n          >\\n            <Icon icon=\\\"{$autoplay ? faPause : faPlay}\\\"></Icon>\\n          </span>\\n          <span class=\\\"btn download tooltip\\\"\\n            on:click=\\\"{downloadFiles}\\\"\\n            data-tooltip=\\\"{downloadstr}\\\"\\n            class:dlready=\\\"{numFavorite}\\\"\\n          >\\n            <Icon icon=\\\"{faDownload}\\\"></Icon>\\n          </span>\\n          <span class=\\\"btn dice tooltip\\\"\\n            on:click=\\\"{shuffleFiles}\\\"\\n            data-tooltip=\\\"Shuffle\\\"\\n          >\\n            <Icon icon=\\\"{faDice}\\\"></Icon>\\n          </span>\\n          <span class=\\\"btn imagevideo tooltip\\\"\\n            data-tooltip=\\\"{imageVideoStr}\\\"\\n            on:click=\\\"{toggleImageVideo}\\\"\\n          >\\n            {#if $imageVideo == 0}\\n              <Icon icon=\\\"{faImageVideo}\\\"></Icon>\\n            {:else if $imageVideo == 1}\\n              <Icon icon=\\\"{faVideo}\\\"></Icon>\\n            {:else if $imageVideo == 2}\\n              <Icon icon=\\\"{faImage}\\\"></Icon>\\n            {/if}\\n          </span>\\n          <span class=\\\"btn muted tooltip\\\"\\n            data-tooltip=\\\"{mutedstr}\\\"\\n            on:click=\\\"{toggleMuted}\\\"\\n          >\\n            <Icon icon=\\\"{$muted ? faSoundOff : faSoundOn}\\\"></Icon>\\n          </span>\\n          {#if tinygoto}\\n            <span class=\\\"btn reload tooltip\\\" data-tooltip=\\\"{reloadstr}\\\" on:click=\\\"{loadMore}\\\" class:loaderror=\\\"{loadError}\\\">\\n              {#if loading}\\n                <Icon icon=\\\"{faSpinner}\\\"></Icon>\\n              {:else}\\n                <Icon icon=\\\"{faSync}\\\"></Icon>\\n              {/if}\\n            </span>\\n          {/if}\\n          <span class=\\\"btn filter tooltip\\\"\\n            class:filterExpanded=\\\"{filterExpanded}\\\"\\n            on:click=\\\"{toggleFilter}\\\"\\n            data-tooltip=\\\"Filter ( / )\\\"\\n            bind:this=\\\"{filterRef}\\\"\\n            class:dlready=\\\"{numFavorite}\\\"\\n          >\\n            {#if filterExpanded}\\n              <input \\n                bind:value=\\\"{filterValue}\\\" \\n                on:click|stopPropagation \\n                on:keydown|stopPropagation \\n                type=\\\"text\\\"\\n                placeholder=\\\"Filter posts...\\\"\\n              >\\n            {:else}\\n              <Icon icon=\\\"{faSearch}\\\"></Icon>\\n            {/if}\\n          </span>\\n          {#if filterValue}\\n            <span class=\\\"btn deepsearch tooltip\\\" data-tooltip=\\\"{deepsearchstr}\\\" on:click=\\\"{gotoDeepSearch}\\\">\\n              <p>deep search 🠒</p>\\n            </span>\\n          {/if}\\n        </div>\\n        <div class=\\\"numswrapper\\\">\\n          {#each displayposts as post, i (post.id + post.url)}\\n            <span class=\\\"nums\\\"\\n              class:currnum=\\\"{index === i}\\\"\\n              class:album=\\\"{currpost.is_album}\\\"\\n              class:favorite=\\\"{displayposts[i].favorite}\\\"\\n              class:over18=\\\"{displayposts[i].over18}\\\"\\n              on:click=\\\"{function(){goto(i)}}\\\"\\n            >\\n              <img class=\\\"small\\\" alt=\\\"{displayposts[i].title}\\\" src=\\\"{displayposts[i].thumbnail}\\\">\\n              <p class=\\\"small\\\" class:curr=\\\"{index === i}\\\" class:album=\\\"{currpost.is_album}\\\">{i+1}</p>\\n            </span>\\n          {/each}\\n          {#if !tinygoto}\\n            <span class=\\\"displayinfo\\\" class:filterExpanded=\\\"{filterValue}\\\">\\n              <p>{displayposts.length}/{posts.length}</p>\\n            </span>\\n            <span class=\\\"btn reload tooltip\\\" data-tooltip=\\\"{reloadstr}\\\" on:click=\\\"{loadMore}\\\" class:loaderror=\\\"{loadError}\\\">\\n              {#if loading}\\n                <Icon icon=\\\"{faSpinner}\\\"></Icon>\\n              {:else}\\n                <Icon icon=\\\"{faSync}\\\"></Icon>\\n              {/if}\\n            </span>\\n          {/if}\\n        </div>\\n      </div>\\n    {/if}\\n  </div>\\n</div>\\n{#if $prefetch}\\n  <div class=\\\"prefetch\\\">\\n    {#each nexturls as nexturl (nexturl.preview.img.default)}\\n      {#if $hires}\\n        {#if nexturl.is_album}\\n          <img alt=\\\"prefetch-hires\\\" src=\\\"{nexturl.preview.img.album[0].hires}\\\">\\n        {:else}\\n          <img alt=\\\"prefetch-hires\\\" src=\\\"{nexturl.url}\\\">\\n        {/if}\\n      {:else}\\n        {#if nexturl.is_album}\\n          <img alt=\\\"prefetch\\\" src=\\\"{nexturl.preview.img.album[0].default}\\\">\\n        {:else if nexturl.preview}\\n          <img alt=\\\"prefetch\\\" src=\\\"{nexturl.preview.img.default}\\\">\\n        {:else}\\n          <img alt=\\\"prefetch\\\" src=\\\"{nexturl.default}\\\">\\n        {/if}\\n      {/if}\\n      {#if nexturl.is_video}\\n        <video playsinline autoplay loop muted>\\n          {#if $lores}\\n            <source src=\\\"{nexturl.preview.vid.lores}\\\">\\n          {:else}\\n            {#if nexturl.preview}\\n              {#if nexturl.preview.vid.webm}\\n                <source src=\\\"{nexturl.preview.vid.webm}\\\">\\n              {/if}\\n              {#if nexturl.preview.vid.mp4}\\n                <source src=\\\"{nexturl.preview.vid.mp4}\\\">\\n              {/if}\\n            {:else}\\n              <source src=\\\"{nexturl.default}\\\">\\n            {/if}\\n          {/if}\\n        </video>\\n      {/if}\\n    {/each}\\n  </div>\\n{/if}\\n\\n<style lang=\\\"sass\\\">:global(html), :global(body) {\\n  margin: 0;\\n  padding: 0;\\n  box-sizing: border-box;\\n  overflow: hidden;\\n}\\n\\n.hide-cursor {\\n  cursor: none;\\n}\\n\\n.hide {\\n  display: none !important;\\n}\\n\\n.wrapper {\\n  height: 100vh;\\n  display: grid;\\n  justify-items: center;\\n  align-items: center;\\n}\\n.wrapper .hero {\\n  height: 100vh;\\n  width: 100vw;\\n  display: flex;\\n  flex-direction: column;\\n  justify-content: space-between;\\n  align-items: center;\\n}\\n.wrapper .hero .title {\\n  z-index: 10;\\n  position: absolute;\\n  left: 1rem;\\n  top: 1rem;\\n  background-color: rgba(26, 26, 26, 0.5);\\n  backdrop-filter: blur(20px);\\n  color: #fafafa;\\n  font-size: 1.2rem;\\n  max-width: 77%;\\n  padding: 1rem 1.5rem;\\n  border-radius: 12px;\\n  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);\\n}\\n.wrapper .hero .settings {\\n  z-index: 10;\\n  position: absolute;\\n  top: 1rem;\\n  right: 1rem;\\n}\\n.wrapper .hero .main-media-container {\\n  flex-grow: 1;\\n  display: flex;\\n  justify-content: center;\\n  align-items: center;\\n  width: 100%;\\n  height: 100%;\\n}\\n.wrapper .hero .main-media-container img, .wrapper .hero .main-media-container video {\\n  max-width: 100%;\\n  max-height: 100%;\\n  object-fit: contain;\\n}\\n.wrapper .hero .goto {\\n  user-select: none;\\n  z-index: 5;\\n  position: absolute;\\n  background-color: rgba(26, 26, 26, 0.5);\\n  backdrop-filter: blur(20px);\\n  bottom: 0;\\n  display: grid;\\n  grid-row-gap: 8px;\\n  padding: 1.5rem 2rem;\\n  border-radius: 12px;\\n  margin: 1rem;\\n  color: #fafafa;\\n  width: calc(100% - 2rem);\\n  grid-template-columns: repeat(auto-fill, minmax(40px, 1fr));\\n  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);\\n}\\n.wrapper .hero .goto.tinygoto {\\n  grid-template-rows: auto 1fr;\\n  grid-template-columns: 1fr;\\n}\\n.wrapper .hero .goto.tinygoto .btnwrapper {\\n  grid-template-columns: repeat(auto-fill, minmax(32px, 1fr));\\n  display: grid;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper {\\n  grid-template-columns: repeat(auto-fit, minmax(1rem, auto));\\n  grid-auto-columns: max-content;\\n  display: grid;\\n  grid-gap: 0.2rem;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .nums {\\n  border-bottom: 3px solid rgba(255, 255, 255, 0.3);\\n  height: 32px;\\n  cursor: pointer;\\n  border-radius: 4px;\\n  transition: all 0.2s ease;\\n  display: flex;\\n  align-items: center;\\n  justify-content: center;\\n  min-width: 40px;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto.tinygoto .numswrapper .nums:hover {\\n    border-bottom: 3px solid #00b4d8 !important;\\n    background-color: rgba(255, 255, 255, 0.1);\\n  }\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .nums.currnum {\\n  border-bottom: 3px solid #00b4d8 !important;\\n  background-color: rgba(0, 180, 216, 0.2);\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .nums.currnum.album {\\n  border-bottom: 3px dotted #00b4d8 !important;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .nums.favorite {\\n  border-bottom: 3px solid #fbbc04;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .nums.over18 {\\n  border-bottom: 3px solid #ea4335;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper p {\\n  display: none;\\n}\\n.wrapper .hero .goto.tinygoto .numswrapper .reload {\\n  grid-column: span 2;\\n}\\n.wrapper .hero .goto .btnwrapper, .wrapper .hero .goto .numswrapper {\\n  display: contents;\\n}\\n.wrapper .hero .goto .btnwrapper .reload {\\n  bottom: -1px;\\n}\\n.wrapper .hero .goto .numswrapper .displayinfo {\\n  grid-column: span 1;\\n  font-size: 0.9rem;\\n  margin-top: 9px;\\n  color: rgba(255, 255, 255, 0.8);\\n}\\n.wrapper .hero .goto .numswrapper .displayinfo p {\\n  margin: 0;\\n  text-align: center;\\n}\\n.wrapper .hero .goto .btn {\\n  text-align: center;\\n  padding: 8px;\\n  color: rgba(255, 255, 255, 0.6);\\n  cursor: pointer;\\n  border-radius: 8px;\\n  transition: all 0.2s ease;\\n  display: flex;\\n  align-items: center;\\n  justify-content: center;\\n  min-width: 40px;\\n  height: 40px;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn:hover {\\n    color: white;\\n    background-color: rgba(255, 255, 255, 0.1);\\n  }\\n}\\n.wrapper .hero .goto .btn.reload {\\n  cursor: pointer;\\n}\\n.wrapper .hero .goto .btn.reload.loaderror {\\n  color: #ea4335;\\n}\\n.wrapper .hero .goto .btn.deepsearch {\\n  grid-column: span 4;\\n  cursor: pointer;\\n  justify-self: center;\\n  background-color: rgba(0, 180, 216, 0.1);\\n  border: 1px solid rgba(0, 180, 216, 0.3);\\n}\\n.wrapper .hero .goto .btn.deepsearch:hover {\\n  background-color: rgba(0, 180, 216, 0.2);\\n  border-color: rgba(0, 180, 216, 0.5);\\n}\\n.wrapper .hero .goto .btn.deepsearch p {\\n  margin: 0;\\n  font-size: 0.9rem;\\n  color: #00b4d8;\\n  padding: 0 1rem;\\n}\\n.wrapper .hero .goto .btn.over18wrapper {\\n  cursor: pointer;\\n  grid-column: span 2;\\n  justify-self: center;\\n}\\n.wrapper .hero .goto .btn.over18wrapper.over18 p {\\n  border: 1px solid rgba(255, 255, 255, 0.3);\\n  color: rgba(255, 255, 255, 0.3);\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn.over18wrapper.over18 p:hover {\\n    border: 1px solid rgba(255, 255, 255, 0.6);\\n    color: rgba(255, 255, 255, 0.6);\\n  }\\n}\\n.wrapper .hero .goto .btn.over18wrapper p {\\n  font-size: 0.9rem;\\n  border: 1px solid #ea4335;\\n  border-radius: 3px;\\n  color: #ea4335;\\n  margin: 0;\\n  width: 58px;\\n  font-family: \\\"Roboto Condensed\\\", sans-serif;\\n  position: relative;\\n  top: -1px;\\n}\\n.wrapper .hero .goto .btn.imagevideo {\\n  cursor: pointer;\\n  font-size: 1.2rem;\\n  color: white;\\n}\\n.wrapper .hero .goto .btn.layout {\\n  cursor: pointer;\\n  font-size: 1.2rem;\\n}\\n.wrapper .hero .goto .btn.layout.active {\\n  color: white;\\n  background-color: rgba(0, 180, 216, 0.2);\\n}\\n.wrapper .hero .goto .btn.muted {\\n  cursor: pointer;\\n  font-size: 1.2rem;\\n  color: white;\\n}\\n.wrapper .hero .goto .btn.filter {\\n  cursor: pointer;\\n  font-size: 1.2rem;\\n  color: white;\\n}\\n.wrapper .hero .goto .btn.filter input {\\n  background-color: rgba(42, 42, 42, 0.8);\\n  border: 1px solid rgba(68, 68, 68, 0.8);\\n  color: white;\\n  padding: 8px 12px;\\n  border-radius: 6px;\\n  font-size: 14px;\\n  outline: none;\\n  min-width: 200px;\\n}\\n.wrapper .hero .goto .btn.filter input:focus {\\n  border-color: #00b4d8;\\n  box-shadow: 0 0 0 2px rgba(0, 180, 216, 0.2);\\n}\\n.wrapper .hero .goto .btn.cog {\\n  cursor: pointer;\\n  font-size: 1.2rem;\\n  color: white;\\n  background-color: rgba(26, 26, 26, 0.95);\\n  backdrop-filter: blur(20px);\\n  border-radius: 12px;\\n  transition: all 0.2s ease;\\n  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn.cog:hover {\\n    background-color: rgba(34, 34, 34, 0.95);\\n    transform: scale(1.05);\\n  }\\n}\\n.wrapper .hero .goto .btn.portraitlandscape {\\n  cursor: pointer;\\n  font-size: 1.4rem;\\n  bottom: 2px;\\n  color: white;\\n}\\n.wrapper .hero .goto .btn.portraitlandscape :global(.landscape) {\\n  transform: rotate(270deg);\\n}\\n.wrapper .hero .goto .btn.dice {\\n  cursor: pointer;\\n  font-size: 1.4rem;\\n  bottom: 2px;\\n  color: white;\\n}\\n.wrapper .hero .goto .btn.download {\\n  cursor: default;\\n  font-size: 1.4rem;\\n  bottom: 2px;\\n}\\n.wrapper .hero .goto .btn.download.dlready {\\n  color: rgba(251, 188, 4, 0.9);\\n  cursor: pointer;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn.download.dlready:hover {\\n    color: #00b4d8;\\n  }\\n}\\n.wrapper .hero .goto .btn.playpause {\\n  cursor: pointer;\\n  top: 1px;\\n}\\n.wrapper .hero .goto .btn.playpause.play {\\n  color: white;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn.playpause:hover {\\n    color: white;\\n  }\\n}\\n.wrapper .hero .goto .btn.filter {\\n  cursor: pointer;\\n  top: 1px;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .goto .btn.filter:hover {\\n    color: white;\\n  }\\n}\\n.wrapper .hero .goto .btn.filter.filter.filterExpanded {\\n  grid-column: span 3;\\n  top: -2px;\\n}\\n.wrapper .hero .goto .btn.filter.filter.filterExpanded input {\\n  width: 85%;\\n  margin-left: 0px;\\n  padding-left: 5px;\\n  padding-right: 5px;\\n  border: 1px solid rgba(255, 255, 255, 0.6);\\n  background-color: rgba(0, 0, 0, 0);\\n  color: white;\\n}\\n.wrapper .hero .goto .nums {\\n  position: relative;\\n  height: 40px;\\n  display: flex;\\n  align-items: center;\\n  justify-content: center;\\n  cursor: pointer;\\n  border-radius: 4px;\\n  transition: all 0.2s ease;\\n  min-width: 40px;\\n}\\n.wrapper .hero .goto .nums.favorite p.small {\\n  border-bottom: 3px solid #e37400 !important;\\n  color: #fbbc04;\\n}\\n.wrapper .hero .goto .nums.favorite img.small {\\n  border-color: #e37400 !important;\\n}\\n.wrapper .hero .goto .nums.over18 p.small {\\n  color: #ea4335;\\n  border-bottom: 3px solid #ea4335;\\n}\\n.wrapper .hero .goto .nums.over18 img.small {\\n  border-color: #ea4335;\\n}\\n.wrapper .hero .goto .nums p.small {\\n  margin: 0;\\n  text-align: center;\\n  cursor: pointer;\\n  border-bottom: 3px solid rgba(0, 0, 0, 0);\\n}\\n.wrapper .hero .goto .nums p.small.curr {\\n  background-color: rgba(255, 255, 255, 0.2);\\n  border-bottom: 3px solid white !important;\\n}\\n.wrapper .hero .goto .nums p.small.curr.album {\\n  border-bottom: 3px dashed white !important;\\n}\\n.wrapper .hero .goto .nums img.small {\\n  z-index: 10;\\n  width: 0px;\\n  opacity: 0;\\n  position: absolute;\\n  bottom: 35px;\\n  border: 2px solid white;\\n  background-color: rgb(76.5, 76.5, 76.5);\\n  min-width: 100px;\\n  pointer-events: none;\\n  object-fit: cover;\\n}\\n.wrapper .hero .goto .nums:hover p.small {\\n  background-color: rgba(255, 255, 255, 0.1);\\n  border-bottom: 3px solid white !important;\\n}\\n.wrapper .hero .goto .nums:hover img {\\n  width: auto;\\n  height: 100px;\\n  opacity: 1;\\n}\\n.wrapper .hero .subredditsearchwrapper {\\n  height: 100vh;\\n  width: 100vw;\\n  position: absolute;\\n  background-color: rgba(0, 0, 0, 0.7);\\n  z-index: 15;\\n}\\n.wrapper .hero .subredditsearchwrapper .subredditsearch {\\n  position: absolute;\\n  left: 50%;\\n  top: 50%;\\n  transform: translate(-50%, -50%);\\n  display: grid;\\n}\\n.wrapper .hero .subredditsearchwrapper .subredditsearch .header {\\n  font-size: 20px;\\n  margin-bottom: 12px;\\n  text-align: center;\\n  color: white;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.input-container) {\\n  height: 40px;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.input-container input) {\\n  padding-left: 5px;\\n  padding-right: 5px;\\n  border: 2px solid rgba(255, 255, 255, 0.6);\\n  background-color: rgba(0, 0, 0, 0);\\n  color: white;\\n  border-radius: 3px;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.autocomplete-list) {\\n  max-height: calc(15 * (1rem + 10px) - 15px) !important;\\n  background-color: black;\\n  border: none;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.autocomplete-list .autocomplete-list-item) {\\n  color: white;\\n  background-color: black;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.autocomplete-list .autocomplete-list-item-create) {\\n  color: white;\\n  background-color: black;\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.autocomplete-list .autocomplete-list-item.selected) {\\n  background-color: rgba(249, 171, 0, 0.2196078431);\\n}\\n.wrapper .hero .subredditsearchwrapper :global(.autocomplete-list .autocomplete-list-item b) {\\n  color: #00b4d8;\\n}\\n.wrapper .hero .image {\\n  height: 100vh;\\n  width: 100vw;\\n  background-size: contain;\\n  background-repeat: no-repeat;\\n  background-position: center;\\n}\\n.wrapper .hero .video {\\n  height: 100vh;\\n  width: 100vw;\\n  object-fit: contain;\\n}\\n.wrapper .prefetch {\\n  position: absolute;\\n  top: 0;\\n  left: 0;\\n  width: 1px;\\n  height: 1px;\\n  overflow: hidden;\\n  opacity: 0;\\n}\\n@media (max-width: 1000px) {\\n  .wrapper .hero .goto {\\n    padding: 1rem 11rem 1rem 1rem;\\n  }\\n}\\n@media (max-width: 800px) {\\n  .wrapper .hero .goto {\\n    padding: 1rem;\\n  }\\n  .wrapper .hero .goto.tinygoto .nums {\\n    height: 0.1rem !important;\\n  }\\n  .wrapper .hero .goto img.small {\\n    display: none;\\n  }\\n}\\n\\n.tooltip {\\n  position: relative;\\n  z-index: 2;\\n  cursor: pointer;\\n}\\n\\n.ttbefore, .tooltip.bottom:before, .tooltip:before {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-bottom: 5px;\\n  margin-left: -30px;\\n  padding: 5px 4px;\\n  width: max-content;\\n  border-radius: 3px;\\n  background-color: black;\\n  color: #fff;\\n  background-color: rgba(255, 255, 255, 0.9);\\n  color: black;\\n  content: attr(data-tooltip);\\n  text-align: center;\\n  font-size: 0.8rem;\\n  line-height: 1.2;\\n}\\n\\n.ttafter, .tooltip.bottom:after, .tooltip:after {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-left: -5px;\\n  width: 0;\\n  border-top: 5px solid rgba(255, 255, 255, 0.9);\\n  border-right: 5px solid transparent;\\n  border-left: 5px solid transparent;\\n  content: \\\" \\\";\\n  font-size: 0;\\n  line-height: 0;\\n}\\n\\n.tooltip:before, .tooltip:after {\\n  visibility: hidden;\\n  opacity: 0;\\n  pointer-events: none;\\n}\\n.tooltip.bottom:before {\\n  bottom: -170%;\\n}\\n.tooltip.bottom:after {\\n  bottom: -40%;\\n  border-bottom: 5px solid rgba(255, 255, 255, 0.9);\\n  border-top: 5px solid transparent;\\n}\\n.tooltip:hover:before, .tooltip:hover:after {\\n  visibility: visible;\\n  opacity: 1;\\n}</style>\"],\"names\":[],\"mappings\":\"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\"}"
 };
 
 function uniqBy(a, key) {
@@ -2105,10 +2280,12 @@ const FullscreenLayout = create_ssr_component(($$result, $$props, $$bindings, sl
 	let $over18, $$unsubscribe_over18;
 	let $portraitLandscape, $$unsubscribe_portraitLandscape;
 	let $imageVideo, $$unsubscribe_imageVideo;
+	let $apiKey, $$unsubscribe_apiKey;
 	let $prefetchNum, $$unsubscribe_prefetchNum;
 	let $muted, $$unsubscribe_muted;
 	let $autoplayinterval, $$unsubscribe_autoplayinterval;
 	let $gotoElWidth, $$unsubscribe_gotoElWidth;
+	let $hideUIonStart, $$unsubscribe_hideUIonStart;
 	let $lores, $$unsubscribe_lores;
 	let $$unsubscribe__gotoElWidth;
 	let $prefetch, $$unsubscribe_prefetch;
@@ -2118,9 +2295,11 @@ const FullscreenLayout = create_ssr_component(($$result, $$props, $$bindings, sl
 	$$unsubscribe_over18 = subscribe(over18, value => $over18 = value);
 	$$unsubscribe_portraitLandscape = subscribe(portraitLandscape, value => $portraitLandscape = value);
 	$$unsubscribe_imageVideo = subscribe(imageVideo, value => $imageVideo = value);
+	$$unsubscribe_apiKey = subscribe(apiKey, value => $apiKey = value);
 	$$unsubscribe_prefetchNum = subscribe(prefetchNum, value => $prefetchNum = value);
 	$$unsubscribe_muted = subscribe(muted, value => $muted = value);
 	$$unsubscribe_autoplayinterval = subscribe(autoplayinterval, value => $autoplayinterval = value);
+	$$unsubscribe_hideUIonStart = subscribe(hideUIonStart, value => $hideUIonStart = value);
 	$$unsubscribe_lores = subscribe(lores, value => $lores = value);
 	$$unsubscribe_prefetch = subscribe(prefetch, value => $prefetch = value);
 	$$unsubscribe_hires = subscribe(hires, value => $hires = value);
@@ -2138,14 +2317,20 @@ const FullscreenLayout = create_ssr_component(($$result, $$props, $$bindings, sl
 	oldreddit.useLocalStorage(false);
 	muted.useLocalStorage(true);
 	layout.useLocalStorage(0);
+	hideUIonStart.useLocalStorage(false);
+	apiKey.useLocalStorage('');
 	let { params, slugstr } = $$props;
-	let { posts } = $$props;
-	let { after } = $$props;
+	let { posts = [] } = $$props;
+	let { after = null } = $$props;
 	let { res } = $$props;
 	let { mode = "tumblr" } = $$props;
+	let { pageType = "user" } = $$props;
 	console.log("Posts from API:", posts);
 	let displayposts = [];
 	console.log("Display Posts (initial):", displayposts);
+	let uiVisible = !$hideUIonStart;
+	let hideCursor = $hideUIonStart;
+	let titleVisible = true;
 	let numFavorite;
 	let tinygoto;
 	let title;
@@ -2161,10 +2346,8 @@ const FullscreenLayout = create_ssr_component(($$result, $$props, $$bindings, sl
 	let loading = false;
 	let reloadstr = "Load more";
 	let imageVideoStr = "";
-	let portraitLandscapeStr = "";
 	let downloadstr = "";
 	let autoplaystr = "";
-	let over18str = "";
 	let mutedstr = "Sound Off";
 	let autoplaytimer;
 	let filterRef;
@@ -2175,17 +2358,27 @@ const FullscreenLayout = create_ssr_component(($$result, $$props, $$bindings, sl
 	let index = 0;
 
 	async function loadMore() {
-		if (!after) return;
+		if (loading) return;
 		loading = true;
 		reloadstr = "Loading ..";
 		let newposts;
 
 		if (mode === "tumblr") {
-			({ posts: newposts, after, ...res } = await get_tumblr_posts(`https://api.tumblr.com/v2/blog/${blogIdentifier}/posts?api_key=ru6b4z2sDMz7h0WyCULiNuqqgDfgubrdQZtZrVUkXQGkzFPTrF&offset=${after}&${queryp(params)}`));
+			let useApiKey = $apiKey || API_KEY;
+			let url;
+
+			if (pageType === 'search') {
+				url = `https://api.tumblr.com/v2/tagged?tag=${blogIdentifier}&api_key=${useApiKey}&before=${after || ''}&${queryp(params)}`;
+			} else {
+				url = `https://api.tumblr.com/v2/blog/${blogIdentifier}/posts?api_key=${useApiKey}&offset=${after || ''}&${queryp(params)}`;
+			}
+
+			({ posts: newposts, after, ...res } = await get_tumblr_posts(url));
 		}
 
-		console.log("API Response (res object):", res);
-		console.log(posts);
+		console.log("[loadMore] API Response (res object):", res);
+		console.log("[loadMore] New posts received:", newposts.length);
+		console.log("[loadMore] Current posts array before combining:", posts.length);
 
 		// load `favorite` from localstorage
 		for (let p of newposts) {
@@ -2195,20 +2388,20 @@ const FullscreenLayout = create_ssr_component(($$result, $$props, $$bindings, sl
 		// Combine `posts` and `newposts` and remove duplicates from multiple network requests
 		posts = [...posts, ...newposts].reduce((r, i) => !r.some(j => i.id === j.id) ? [...r, i] : r, []);
 
-		console.log("Before dedupe: ", posts.length);
+		console.log("[loadMore] Posts after initial combine (before URL dedupe): ", posts.length);
 
 		// Remove duplicates, based on `url`
 		posts = posts.filter((v, i, a) => a.findIndex(t => t.url == v.url) === i);
 
-		console.log("After dedupe/Total loaded: ", posts.length);
+		console.log("[loadMore] After dedupe/Total loaded: ", posts.length);
+		console.log("[loadMore] Next 'after' value:", after);
 		loading = false;
 		reloadstr = "Load more";
 	}
 
 	onMount(async () => {
-		console.log("Posts on mount:", posts);
-		console.log("Display Posts on mount:", displayposts);
-		loadMore(); // Call loadMore on mount
+		// Always try to load data on mount, regardless of API key status
+		loadMore();
 
 		// Start autoplay by default
 		if ($autoplay) {
@@ -2324,6 +2517,7 @@ const FullscreenLayout = create_ssr_component(($$result, $$props, $$bindings, sl
 	if ($$props.after === void 0 && $$bindings.after && after !== void 0) $$bindings.after(after);
 	if ($$props.res === void 0 && $$bindings.res && res !== void 0) $$bindings.res(res);
 	if ($$props.mode === void 0 && $$bindings.mode && mode !== void 0) $$bindings.mode(mode);
+	if ($$props.pageType === void 0 && $$bindings.pageType && pageType !== void 0) $$bindings.pageType(pageType);
 	$$result.css.add(css$3);
 	let $$settled;
 	let $$rendered;
@@ -2385,8 +2579,26 @@ const FullscreenLayout = create_ssr_component(($$result, $$props, $$bindings, sl
 							title: "Nothing to show. Try changing filters or tweak/update URL."
 						};
 					} else if (res && !res.res.ok) {
-						// Invalid subreddit
-						currpost = { title: "Error" };
+						// Check if it's an API key error
+						console.log("API Error Response:", res);
+
+						// Handle API errors with helpful messaging
+						const errorMessage = res.res.res || res.res || "";
+
+						// Check if it's an API key error
+						const isApiKeyError = errorMessage.includes("Invalid API key") || errorMessage.includes("OAuth Consumer Key Goes Here") || errorMessage.includes("api_key") || !$apiKey;
+
+						if (isApiKeyError) {
+							currpost = {
+								title: "Please set your Tumblr API key in settings"
+							};
+						} else // showSettings = true; // Uncomment this line if you want settings to open automatically
+						{
+							currpost = {
+								title: "Error loading posts", // Optionally show settings, but don't force it
+								
+							};
+						}
 					} else {
 						// Default
 						currpost = { title: "Loading .." };
@@ -2457,14 +2669,6 @@ const FullscreenLayout = create_ssr_component(($$result, $$props, $$bindings, sl
 				autoplaystr = `Autoplay is ${$autoplay ? "on" : "off"}`;
 				mutedstr = `Sound ${$muted ? "off" : "on"}`;
 
-				if ($over18 == 0) {
-					over18str = "nsfw off";
-				} else if ($over18 == 1) {
-					over18str = "nsfw on";
-				} else if ($over18 == 2) {
-					over18str = "nsfw only";
-				}
-
 				if ($imageVideo == 0) {
 					imageVideoStr = "Show both image and video";
 				} else if ($imageVideo == 1) {
@@ -2472,47 +2676,26 @@ const FullscreenLayout = create_ssr_component(($$result, $$props, $$bindings, sl
 				} else if ($imageVideo == 2) {
 					imageVideoStr = "Show images only";
 				}
-
-				if ($portraitLandscape == 0) {
-					portraitLandscapeStr = "Show all media";
-				} else if ($portraitLandscape == 1) {
-					portraitLandscapeStr = "Show only portrait media";
-				} else if ($portraitLandscape == 2) {
-					portraitLandscapeStr = "Show only landscape media";
-				}
 			}
 		}
 
 		$$rendered = `
-${($$result.head += `${($$result.title = `<title>tumblrpx - ${escape(slugstr ? `t/${slugstr}` : "tumblr.com")}</title>`, "")}`, "")}
+${($$result.head += '<!-- HEAD_svelte-ppmq07_START -->' + `${($$result.title = `<title>tumblrpx - ${escape(slugstr ? `t/${slugstr}` : "tumblr.com")}</title>`, "")}` + '<!-- HEAD_svelte-ppmq07_END -->', "")}
 
-<div class="${["wrapper svelte-1a8m49b", "hide-cursor" ].join(' ').trim()}"><div class="${"hero svelte-1a8m49b"}"><div class="${[
-			"title svelte-1a8m49b",
-			("hide" ) + ' ' + (currpost.favorite ? "favorite" : "")
-		].join(' ').trim()}">${displayposts.length
-		? `<span class="${"fav svelte-1a8m49b"}">${validate_component(Icon, "Icon").$$render(
-				$$result,
-				{
-					icon: currpost.favorite ? faStar$3.faStar : faStar$1.faStar
-				},
-				{},
-				{}
-			)}</span>`
-		: ``}
-      ${currpost.dims
+<div class="${["wrapper svelte-1qdlkqz", hideCursor ? "hide-cursor" : ""].join(' ').trim()}"><div class="hero svelte-1qdlkqz"><div class="${[
+			"title svelte-1qdlkqz",
+			(!uiVisible || !titleVisible ? "hide" : "") + ' ' + (currpost.favorite ? "favorite" : "")
+		].join(' ').trim()}">${currpost.dims && currpost.dims.width > 0
 		? `${escape(title)} (${escape(currpost.dims.width)}x${escape(currpost.dims.height)})`
 		: `${escape(title)}`}
       ${currpost.subreddit
-		? `<div class="${"subreddit"}"><p class="${"subredditp svelte-1a8m49b"}">${escape(currpost.subredditp)}</p>
-          <p class="${"user svelte-1a8m49b"}">${escape(currpost.authorp)}</p></div>`
+		? `<div class="subreddit"><p class="user svelte-1qdlkqz">${escape(currpost.authorp)}</p></div>`
 		: ``}</div>
-    <div class="${"settings svelte-1a8m49b"}"><a class="${["donate svelte-1a8m49b", currpost.favorite == false ? "hide" : ""].join(' ').trim()}" href="${"https://ko-fi.com/redditpx"}" target="${"_blank"}"><span class="${"btn tooltip bottom donate svelte-1a8m49b"}" data-tooltip="${"Donate"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faDonate$1.faDonate }, {}, {})}</span></a>
-      <a class="${["home svelte-1a8m49b", "hide" ].join(' ').trim()}" rel="${"prefetch"}" href="${"/home"}"><span class="${"btn tooltip bottom svelte-1a8m49b"}" data-tooltip="${"Home"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faHome$1.faHome }, {}, {})}</span></a>
-      <span class="${[
-			"btn cog svelte-1a8m49b",
-			(showSettings ? "showSettings" : "") + ' ' + ("hide" )
+    <div class="settings svelte-1qdlkqz"><span class="${[
+			"btn cog svelte-1qdlkqz",
+			(showSettings ? "showSettings" : "") + ' ' + (uiVisible == false ? "hide" : "")
 		].join(' ').trim()}">${validate_component(Icon, "Icon").$$render($$result, { icon: faCog$1.faCog }, {}, {})}</span>
-      <div class="${["div svelte-1a8m49b", "hide" ].join(' ').trim()}">${validate_component(Settings, "Settings").$$render(
+      <div class="${["div svelte-1qdlkqz", uiVisible == false ? "hide" : ""].join(' ').trim()}">${validate_component(Settings, "Settings").$$render(
 			$$result,
 			{ showSettings },
 			{
@@ -2523,10 +2706,10 @@ ${($$result.head += `${($$result.title = `<title>tumblrpx - ${escape(slugstr ? `
 			},
 			{}
 		)}</div></div>
-    <div class="${"main-media-container svelte-1a8m49b"}">${currpost.is_image && !currpost.is_album
-		? `<img${add_attribute("src", currpost.preview.img.default, 0)}${add_attribute("alt", currpost.title, 0)} style="${"max-width: 100%; max-height: 100vh; object-fit: contain;"}" class="${"svelte-1a8m49b"}">`
+    <div class="main-media-container svelte-1qdlkqz">${currpost.is_image && !currpost.is_album
+		? `<img${add_attribute("src", currpost.preview.img.default, 0)}${add_attribute("alt", currpost.title, 0)} style="height: 100vh; object-fit: contain;" class="svelte-1qdlkqz">`
 		: `${currpost.is_video && renderVideo
-			? `<video class="${["video svelte-1a8m49b", "hide-cursor" ].join(' ').trim()}" autoplay ${!$autoplay ? "loop" : ""} playsinline ${$muted ? "muted" : ""} id="${"videoplayerid"}">${$lores
+			? `<video class="${["video svelte-1qdlkqz", hideCursor ? "hide-cursor" : ""].join(' ').trim()}" autoplay ${!$autoplay ? "loop" : ""} playsinline ${$muted ? "muted" : ""} id="videoplayerid">${$lores
 				? `<source${add_attribute("src", currpost.preview.vid.lores, 0)}>`
 				: `${currpost.preview.vid.webm
 					? `<source${add_attribute("src", currpost.preview.vid.webm, 0)}>`
@@ -2536,75 +2719,64 @@ ${($$result.head += `${($$result.title = `<title>tumblrpx - ${escape(slugstr ? `
 					: ``}`}</video>`
 			: `${currpost.is_album
 				? `${currpost.preview.img.album[albumindex].is_video
-					? `<video class="${["video svelte-1a8m49b", "hide-cursor" ].join(' ').trim()}" autoplay ${!$autoplay ? "loop" : ""} playsinline ${$muted ? "muted" : ""}><source${add_attribute("src", currpost.preview.img.album[albumindex].hires, 0)}></video>`
-					: `<img${add_attribute("src", currpost.preview.img.album[albumindex].default, 0)}${add_attribute("alt", currpost.title, 0)} style="${"max-width: 100%; max-height: 100vh; object-fit: contain;"}" class="${"svelte-1a8m49b"}">`}`
+					? `<video class="${["video svelte-1qdlkqz", hideCursor ? "hide-cursor" : ""].join(' ').trim()}" autoplay ${!$autoplay ? "loop" : ""} playsinline ${$muted ? "muted" : ""}><source${add_attribute("src", currpost.preview.img.album[albumindex].hires, 0)}></video>`
+					: `<img${add_attribute("src", currpost.preview.img.album[albumindex].default, 0)}${add_attribute("alt", currpost.title, 0)} style="height: 100vh; object-fit: contain;" class="svelte-1qdlkqz">`}`
 				: ``}`}`}</div>
     
     ${displayposts.length || posts.length
 		? `<div class="${[
-				"goto svelte-1a8m49b",
-				(tinygoto ? "tinygoto" : "") + ' ' + ("hide" )
-			].join(' ').trim()}"><div class="${"btnwrapper svelte-1a8m49b"}"><span class="${["btn playpause tooltip svelte-1a8m49b", $autoplay ? "play" : ""].join(' ').trim()}"${add_attribute("data-tooltip", autoplaystr, 0)}>${validate_component(Icon, "Icon").$$render($$result, { icon: $autoplay ? faPause$1.faPause : faPlay$1.faPlay }, {}, {})}</span>
-          <span class="${["btn download tooltip svelte-1a8m49b", numFavorite ? "dlready" : ""].join(' ').trim()}"${add_attribute("data-tooltip", downloadstr, 0)}>${validate_component(Icon, "Icon").$$render($$result, { icon: faCloudDownloadAlt$1.faCloudDownloadAlt }, {}, {})}</span>
-          <span class="${"btn dice tooltip svelte-1a8m49b"}" data-tooltip="${"Shuffle"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faDice$1.faDice }, {}, {})}</span>
-          <span class="${[
-				"btn portraitlandscape tooltip svelte-1a8m49b",
-				$portraitLandscape ? "active" : ""
-			].join(' ').trim()}"${add_attribute("data-tooltip", portraitLandscapeStr, 0)}>${$portraitLandscape == 0
-			? `${validate_component(Icon, "Icon").$$render($$result, { icon: faDesktop$1.faDesktop }, {}, {})}`
-			: `${$portraitLandscape == 1
-				? `${validate_component(Icon, "Icon").$$render($$result, { icon: faMobileAlt$1.faMobileAlt }, {}, {})}`
-				: `${$portraitLandscape == 2
-					? `${validate_component(Icon, "Icon").$$render($$result, { class: "landscape", icon: faMobileAlt$1.faMobileAlt }, {}, {})}`
-					: ``}`}`}</span>
-          <span class="${"btn imagevideo tooltip svelte-1a8m49b"}"${add_attribute("data-tooltip", imageVideoStr, 0)}>${$imageVideo == 0
+				"goto svelte-1qdlkqz",
+				(tinygoto ? "tinygoto" : "") + ' ' + (uiVisible == false ? "hide" : "")
+			].join(' ').trim()}"><div class="btnwrapper svelte-1qdlkqz"><span class="${["btn playpause tooltip svelte-1qdlkqz", $autoplay ? "play" : ""].join(' ').trim()}"${add_attribute("data-tooltip", autoplaystr, 0)}>${validate_component(Icon, "Icon").$$render($$result, { icon: $autoplay ? faPause$1.faPause : faPlay$1.faPlay }, {}, {})}</span>
+          <span class="${["btn download tooltip svelte-1qdlkqz", numFavorite ? "dlready" : ""].join(' ').trim()}"${add_attribute("data-tooltip", downloadstr, 0)}>${validate_component(Icon, "Icon").$$render($$result, { icon: faCloudDownloadAlt$1.faCloudDownloadAlt }, {}, {})}</span>
+          <span class="btn dice tooltip svelte-1qdlkqz" data-tooltip="Shuffle">${validate_component(Icon, "Icon").$$render($$result, { icon: faDice$1.faDice }, {}, {})}</span>
+          <span class="btn imagevideo tooltip svelte-1qdlkqz"${add_attribute("data-tooltip", imageVideoStr, 0)}>${$imageVideo == 0
 			? `${validate_component(Icon, "Icon").$$render($$result, { icon: faPhotoVideo$1.faPhotoVideo }, {}, {})}`
 			: `${$imageVideo == 1
 				? `${validate_component(Icon, "Icon").$$render($$result, { icon: faVideo$1.faVideo }, {}, {})}`
 				: `${$imageVideo == 2
 					? `${validate_component(Icon, "Icon").$$render($$result, { icon: faImage$1.faImage }, {}, {})}`
 					: ``}`}`}</span>
-          <span class="${"btn muted tooltip svelte-1a8m49b"}"${add_attribute("data-tooltip", mutedstr, 0)}>${validate_component(Icon, "Icon").$$render($$result, { icon: $muted ? faVolumeMute$1.faVolumeMute : faVolumeUp$1.faVolumeUp }, {}, {})}</span>
+          <span class="btn muted tooltip svelte-1qdlkqz"${add_attribute("data-tooltip", mutedstr, 0)}>${validate_component(Icon, "Icon").$$render($$result, { icon: $muted ? faVolumeMute$1.faVolumeMute : faVolumeUp$1.faVolumeUp }, {}, {})}</span>
           ${tinygoto
-			? `<span class="${["btn reload tooltip svelte-1a8m49b", loadError ? "loaderror" : ""].join(' ').trim()}"${add_attribute("data-tooltip", reloadstr, 0)}>${loading
+			? `<span class="${["btn reload tooltip svelte-1qdlkqz", loadError ? "loaderror" : ""].join(' ').trim()}"${add_attribute("data-tooltip", reloadstr, 0)}>${loading
 				? `${validate_component(Icon, "Icon").$$render($$result, { icon: faSpinner$1.faSpinner }, {}, {})}`
 				: `${validate_component(Icon, "Icon").$$render($$result, { icon: faSync$1.faSync }, {}, {})}`}</span>`
 			: ``}
-          <span class="${["btn over18wrapper tooltip svelte-1a8m49b", !$over18 ? "over18" : ""].join(' ').trim()}"${add_attribute("data-tooltip", over18str, 0)}><p class="${"svelte-1a8m49b"}">${escape(over18str)}</p></span>
           <span class="${[
-				"btn filter tooltip svelte-1a8m49b",
+				"btn filter tooltip svelte-1qdlkqz",
 				("") + ' ' + (numFavorite ? "dlready" : "")
-			].join(' ').trim()}" data-tooltip="${"Filter ( / )"}"${add_attribute("this", filterRef, 0)}>${`${validate_component(Icon, "Icon").$$render($$result, { icon: faSearch$1.faSearch }, {}, {})}`}</span>
+			].join(' ').trim()}" data-tooltip="Filter ( / )"${add_attribute("this", filterRef, 0)}>${`${validate_component(Icon, "Icon").$$render($$result, { icon: faSearch$1.faSearch }, {}, {})}`}</span>
           ${``}</div>
-        <div class="${"numswrapper svelte-1a8m49b"}">${each(displayposts, (post, i) => {
+        <div class="numswrapper svelte-1qdlkqz">${each(displayposts, (post, i) => {
 				return `<span class="${[
-					"nums svelte-1a8m49b",
+					"nums svelte-1qdlkqz",
 					(index === i ? "currnum" : "") + ' ' + (currpost.is_album ? "album" : "") + ' ' + (displayposts[i].favorite ? "favorite" : "") + ' ' + (displayposts[i].over18 ? "over18" : "")
-				].join(' ').trim()}"><img class="${"small svelte-1a8m49b"}"${add_attribute("alt", displayposts[i].title, 0)}${add_attribute("src", displayposts[i].thumbnail, 0)}>
+				].join(' ').trim()}"><img class="small svelte-1qdlkqz"${add_attribute("alt", displayposts[i].title, 0)}${add_attribute("src", displayposts[i].thumbnail, 0)}>
               <p class="${[
-					"small svelte-1a8m49b",
+					"small svelte-1qdlkqz",
 					(index === i ? "curr" : "") + ' ' + (currpost.is_album ? "album" : "")
 				].join(' ').trim()}">${escape(i + 1)}</p>
             </span>`;
 			})}
           ${!tinygoto
-			? `<span class="${["displayinfo svelte-1a8m49b", ""].join(' ').trim()}"><p class="${"svelte-1a8m49b"}">${escape(displayposts.length)}/${escape(posts.length)}</p></span>
-            <span class="${["btn reload tooltip svelte-1a8m49b", loadError ? "loaderror" : ""].join(' ').trim()}"${add_attribute("data-tooltip", reloadstr, 0)}>${loading
+			? `<span class="${["displayinfo svelte-1qdlkqz", ""].join(' ').trim()}"><p class="svelte-1qdlkqz">${escape(displayposts.length)}/${escape(posts.length)}</p></span>
+            <span class="${["btn reload tooltip svelte-1qdlkqz", loadError ? "loaderror" : ""].join(' ').trim()}"${add_attribute("data-tooltip", reloadstr, 0)}>${loading
 				? `${validate_component(Icon, "Icon").$$render($$result, { icon: faSpinner$1.faSpinner }, {}, {})}`
 				: `${validate_component(Icon, "Icon").$$render($$result, { icon: faSync$1.faSync }, {}, {})}`}</span>`
 			: ``}</div></div>`
 		: ``}</div></div>
 ${$prefetch
-		? `<div class="${"prefetch"}">${each(nexturls, nexturl => {
+		? `<div class="prefetch">${each(nexturls, nexturl => {
 				return `${$hires
 				? `${nexturl.is_album
-					? `<img alt="${"prefetch-hires"}"${add_attribute("src", nexturl.preview.img.album[0].hires, 0)}>`
-					: `<img alt="${"prefetch-hires"}"${add_attribute("src", nexturl.url, 0)}>`}`
+					? `<img alt="prefetch-hires"${add_attribute("src", nexturl.preview.img.album[0].hires, 0)}>`
+					: `<img alt="prefetch-hires"${add_attribute("src", nexturl.url, 0)}>`}`
 				: `${nexturl.is_album
-					? `<img alt="${"prefetch"}"${add_attribute("src", nexturl.preview.img.album[0].default, 0)}>`
+					? `<img alt="prefetch"${add_attribute("src", nexturl.preview.img.album[0].default, 0)}>`
 					: `${nexturl.preview
-						? `<img alt="${"prefetch"}"${add_attribute("src", nexturl.preview.img.default, 0)}>`
-						: `<img alt="${"prefetch"}"${add_attribute("src", nexturl.default, 0)}>`}`}`}
+						? `<img alt="prefetch"${add_attribute("src", nexturl.preview.img.default, 0)}>`
+						: `<img alt="prefetch"${add_attribute("src", nexturl.default, 0)}>`}`}`}
       ${nexturl.is_video
 				? `<video playsinline autoplay loop muted>${$lores
 					? `<source${add_attribute("src", nexturl.preview.vid.lores, 0)}>`
@@ -2626,10 +2798,12 @@ ${$prefetch
 	$$unsubscribe_over18();
 	$$unsubscribe_portraitLandscape();
 	$$unsubscribe_imageVideo();
+	$$unsubscribe_apiKey();
 	$$unsubscribe_prefetchNum();
 	$$unsubscribe_muted();
 	$$unsubscribe_autoplayinterval();
 	$$unsubscribe_gotoElWidth();
+	$$unsubscribe_hideUIonStart();
 	$$unsubscribe_lores();
 	$$unsubscribe__gotoElWidth();
 	$$unsubscribe_prefetch();
@@ -2637,13 +2811,25 @@ ${$prefetch
 	return $$rendered;
 });
 
-/* src/routes/index.svelte generated by Svelte v3.46.2 */
+/* src/routes/index.svelte generated by Svelte v3.59.2 */
 
 async function preload$2({ path, params, query }) {
 	if (typeof window === "undefined") return;
-	let slugstr = "cheezbot";
-	let { posts, res, after } = await get_tumblr_posts(`https://api.tumblr.com/v2/blog/${slugstr}/posts?api_key=ru6b4z2sDMz7h0WyCULiNuqqgDfgubrdQZtZrVUkXQGkzFPTrF&${queryp(query)}`);
-	return { posts, after, res, slugstr };
+	let slugstr = query.user || "cheezbot";
+
+	// Check if we have a valid API key before making the request
+	{
+		// Return empty data to let the client handle API key setup
+		return {
+			posts: [],
+			after: null,
+			res: {
+				ok: false,
+				res: "Invalid API key. Please set your Tumblr API key in settings."
+			},
+			slugstr
+		};
+	}
 }
 
 const Routes = create_ssr_component(($$result, $$props, $$bindings, slots) => {
@@ -2696,11 +2882,11 @@ var component_0 = /*#__PURE__*/Object.freeze({
     preload: preload$2
 });
 
-/* src/routes/download.svelte generated by Svelte v3.46.2 */
+/* src/routes/download.svelte generated by Svelte v3.59.2 */
 
 const css$2 = {
-	code: ".wrapper.svelte-scsxcb.svelte-scsxcb{height:100vh;display:grid;justify-items:center;align-items:center}.wrapper.svelte-scsxcb .hero.svelte-scsxcb{height:100vh;width:100%;display:grid;justify-items:center;align-items:center;grid-auto-rows:max-content;grid-row-gap:3rem;padding-top:5rem}.wrapper.svelte-scsxcb .hero .settings.svelte-scsxcb{z-index:10;position:absolute;top:0;right:0;color:#fafafa;font-size:1rem;padding:1.5rem}.wrapper.svelte-scsxcb .hero .settings .home.svelte-scsxcb{margin-right:7px}.wrapper.svelte-scsxcb .hero .settings .btn.svelte-scsxcb{user-select:none;cursor:pointer;color:rgba(255, 255, 255, 0.8)}.wrapper.svelte-scsxcb .hero .settings .btn.showSettings.svelte-scsxcb{color:white}@media not all and (pointer: coarse){.wrapper.svelte-scsxcb .hero .settings .btn.svelte-scsxcb:hover{color:white}}.wrapper.svelte-scsxcb .hero .title.svelte-scsxcb{z-index:10;position:absolute;top:0;background-color:rgba(0, 0, 0, 0.4);color:#fafafa;font-size:1.5rem;padding:1rem;border-radius:3px;cursor:pointer}@media not all and (pointer: coarse){.wrapper.svelte-scsxcb .hero .title.svelte-scsxcb:hover{background-color:rgba(0, 0, 0, 0.8)}}.wrapper.svelte-scsxcb .hero .title .logo.svelte-scsxcb{user-select:none;cursor:pointer;top:5px;position:relative;margin-right:9px}.wrapper.svelte-scsxcb .hero .title .logo img.svelte-scsxcb{height:2rem}.wrapper.svelte-scsxcb .hero .title.svelte-scsxcb svg{margin-right:10px;top:3px;position:relative}.wrapper.svelte-scsxcb .hero .title .subtitle.svelte-scsxcb{margin-top:1rem;font-size:1rem;color:#e1e1e1}.wrapper.svelte-scsxcb .hero .title .subtitle p.sub.svelte-scsxcb{margin:0}.wrapper.svelte-scsxcb .hero .title .filter span.svelte-scsxcb{font-size:1rem;margin-right:10px}.wrapper.svelte-scsxcb .hero .title .filter input.svelte-scsxcb{padding-left:5px;padding-right:5px;border:1px solid rgba(255, 255, 255, 0.6);background-color:rgba(0, 0, 0, 0);color:white;height:1.5rem}.wrapper.svelte-scsxcb .hero .imgwrapper.svelte-scsxcb{display:grid;grid-gap:2rem;justify-content:center;align-content:center}.wrapper.svelte-scsxcb .hero .imgwrapper .media.svelte-scsxcb{justify-self:center}.wrapper.svelte-scsxcb .hero .imgwrapper .media img.svelte-scsxcb{max-width:100%}.wrapper.svelte-scsxcb .hero .imgwrapper .media video.svelte-scsxcb{max-width:100%}.tooltip.svelte-scsxcb.svelte-scsxcb{position:relative;z-index:2;cursor:pointer}.tooltip.svelte-scsxcb.svelte-scsxcb:before,.tooltip.svelte-scsxcb.svelte-scsxcb:after{visibility:hidden;opacity:0;pointer-events:none}.tooltip.svelte-scsxcb.svelte-scsxcb:before{position:absolute;bottom:120%;left:50%;margin-bottom:5px;margin-left:-30px;padding:5px 4px;width:60px;border-radius:3px;background-color:black;color:#fff;background-color:rgba(255, 255, 255, 0.9);color:black;content:attr(data-tooltip);text-align:center;font-size:0.8rem;line-height:1.2}.tooltip.svelte-scsxcb.svelte-scsxcb:after{position:absolute;bottom:120%;left:50%;margin-left:-5px;width:0;border-top:5px solid #000;border-top:5px solid rgba(51, 51, 51, 0.9);border-right:5px solid transparent;border-left:5px solid transparent;content:\" \";font-size:0;line-height:0}.tooltip.svelte-scsxcb.svelte-scsxcb:hover:before,.tooltip.svelte-scsxcb.svelte-scsxcb:hover:after{visibility:visible;opacity:1}",
-	map: "{\"version\":3,\"file\":\"download.svelte\",\"sources\":[\"download.svelte\"],\"sourcesContent\":[\"<script>\\n  import Icon from \\\"fa-svelte/src/Icon.svelte\\\";\\n  import { faCloudDownloadAlt as faDownload } from \\\"@fortawesome/free-solid-svg-icons/faCloudDownloadAlt\\\";\\n  import { faCog as faSettings } from \\\"@fortawesome/free-solid-svg-icons/faCog\\\";\\n  import { faHome } from \\\"@fortawesome/free-solid-svg-icons/faHome\\\";\\n\\n  import Settings from \\\"../components/Settings.svelte\\\";\\n\\n  import { favorite } from \\\"../_prefs\\\";\\n  favorite.useLocalStorage({});\\n\\n  let filterValue;\\n  let displayposts;\\n\\n  let showSettings = false;\\n\\n  function toggleSettings() {\\n    showSettings = !showSettings;\\n  }\\n\\n  $: {\\n    let tmp;\\n    if (filterValue) {\\n      tmp = Object.entries($favorite).filter((item) => {\\n        let details = item[1];\\n\\n        // poor mans search\\n        // Find all the `values`, make a giant string and substring match\\n        return Object.values(details).join(\\\" \\\").includes(filterValue);\\n      });\\n      displayposts = tmp;\\n    } else {\\n      displayposts = $favorite ? Object.entries($favorite) : [];\\n    }\\n  }\\n</script>\\n\\n<svelte:head>\\n  <title>tumblrpx - download</title>\\n</svelte:head>\\n\\n<div class=\\\"wrapper\\\"><div class=\\\"hero\\\"><div class=\\\"title\\\"><span class=\\\"logo\\\"><img alt=\\\"tumblrpx logo\\\" src=\\\"logo-192.png\\\"></span>tumblrpx download {$favorite ? `(${Object.keys($favorite).length} items)` : '' }<div class=\\\"subtitle\\\"><p class=\\\"sub\\\">Right click on the page (not on any image) > Save as > Select \\\"Webpage, Complete\\\".</p><p class=\\\"sub\\\">Alternatively, hit Ctrl+S > Select \\\"Webpage, Complete\\\"</p></div><div class=\\\"filter\\\"><span>Filter ({displayposts.length})</span><input bind:value=\\\"{filterValue}\\\" type=\\\"text\\\"></div></div><div class=\\\"settings\\\"><a class=\\\"home\\\" rel=\\\"prefetch\\\" href=\\\"/home\\\"><span class=\\\"btn tooltip\\\" data-tooltip=\\\"Home\\\"><Icon icon=\\\"{faHome}\\\"></Icon></span></a><span class=\\\"btn\\\" on:click=\\\"{toggleSettings}\\\" class:showSettings=\\\"{showSettings}\\\"><Icon icon=\\\"{faSettings}\\\"></Icon></span><Settings {showSettings}></Settings></div><div class=\\\"imgwrapper\\\">{#each displayposts as [url, post]}{#if post.is_album}{#each post.preview.img.album as album}{#if album.is_image}<div class=\\\"media\\\"><img alt=\\\"image\\\" src=\\\"{album.hires}\\\"></div>{:else}<div class=\\\"media\\\"><video autoplay loop playsinline muted><source src=\\\"{album.hires}\\\"></video></div>{/if}{/each}{:else if post.is_image}<div class=\\\"media\\\"><img alt=\\\"image\\\" src=\\\"{url}\\\"></div>{:else if post.is_video}<div class=\\\"media\\\"><video autoplay loop playsinline muted>{#if post.preview.vid.webm}<source src=\\\"{post.preview.vid.webm}\\\">{/if}{#if post.preview.vid.mp4}<source src=\\\"{post.preview.vid.mp4}\\\">{/if}</video></div>{/if}{/each}</div></div></div>\\n\\n<style lang=\\\"sass\\\">.wrapper {\\n  height: 100vh;\\n  display: grid;\\n  justify-items: center;\\n  align-items: center;\\n}\\n.wrapper .hero {\\n  height: 100vh;\\n  width: 100%;\\n  display: grid;\\n  justify-items: center;\\n  align-items: center;\\n  grid-auto-rows: max-content;\\n  grid-row-gap: 3rem;\\n  padding-top: 5rem;\\n}\\n.wrapper .hero .settings {\\n  z-index: 10;\\n  position: absolute;\\n  top: 0;\\n  right: 0;\\n  color: #fafafa;\\n  font-size: 1rem;\\n  padding: 1.5rem;\\n}\\n.wrapper .hero .settings .home {\\n  margin-right: 7px;\\n}\\n.wrapper .hero .settings .btn {\\n  user-select: none;\\n  cursor: pointer;\\n  color: rgba(255, 255, 255, 0.8);\\n}\\n.wrapper .hero .settings .btn.showSettings {\\n  color: white;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .settings .btn:hover {\\n    color: white;\\n  }\\n}\\n.wrapper .hero .title {\\n  z-index: 10;\\n  position: absolute;\\n  top: 0;\\n  background-color: rgba(0, 0, 0, 0.4);\\n  color: #fafafa;\\n  font-size: 1.5rem;\\n  padding: 1rem;\\n  border-radius: 3px;\\n  cursor: pointer;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .title:hover {\\n    background-color: rgba(0, 0, 0, 0.8);\\n  }\\n}\\n.wrapper .hero .title .logo {\\n  user-select: none;\\n  cursor: pointer;\\n  top: 5px;\\n  position: relative;\\n  margin-right: 9px;\\n}\\n.wrapper .hero .title .logo img {\\n  height: 2rem;\\n}\\n.wrapper .hero .title :global(svg) {\\n  margin-right: 10px;\\n  top: 3px;\\n  position: relative;\\n}\\n.wrapper .hero .title .subtitle {\\n  margin-top: 1rem;\\n  font-size: 1rem;\\n  color: #e1e1e1;\\n}\\n.wrapper .hero .title .subtitle p.sub {\\n  margin: 0;\\n}\\n.wrapper .hero .title .filter span {\\n  font-size: 1rem;\\n  margin-right: 10px;\\n}\\n.wrapper .hero .title .filter input {\\n  padding-left: 5px;\\n  padding-right: 5px;\\n  border: 1px solid rgba(255, 255, 255, 0.6);\\n  background-color: rgba(0, 0, 0, 0);\\n  color: white;\\n  height: 1.5rem;\\n}\\n.wrapper .hero .imgwrapper {\\n  display: grid;\\n  grid-gap: 2rem;\\n  justify-content: center;\\n  align-content: center;\\n}\\n.wrapper .hero .imgwrapper .media {\\n  justify-self: center;\\n}\\n.wrapper .hero .imgwrapper .media img {\\n  max-width: 100%;\\n}\\n.wrapper .hero .imgwrapper .media video {\\n  max-width: 100%;\\n}\\n\\n.tooltip {\\n  position: relative;\\n  z-index: 2;\\n  cursor: pointer;\\n}\\n\\n.tooltip:before, .tooltip:after {\\n  visibility: hidden;\\n  opacity: 0;\\n  pointer-events: none;\\n}\\n.tooltip:before {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-bottom: 5px;\\n  margin-left: -30px;\\n  padding: 5px 4px;\\n  width: 60px;\\n  border-radius: 3px;\\n  background-color: black;\\n  color: #fff;\\n  background-color: rgba(255, 255, 255, 0.9);\\n  color: black;\\n  content: attr(data-tooltip);\\n  text-align: center;\\n  font-size: 0.8rem;\\n  line-height: 1.2;\\n}\\n.tooltip:after {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-left: -5px;\\n  width: 0;\\n  border-top: 5px solid #000;\\n  border-top: 5px solid rgba(51, 51, 51, 0.9);\\n  border-right: 5px solid transparent;\\n  border-left: 5px solid transparent;\\n  content: \\\" \\\";\\n  font-size: 0;\\n  line-height: 0;\\n}\\n.tooltip:hover:before, .tooltip:hover:after {\\n  visibility: visible;\\n  opacity: 1;\\n}</style>\\n\"],\"names\":[],\"mappings\":\"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\"}"
+	code: ".wrapper.svelte-dk7jlv.svelte-dk7jlv{height:100vh;display:grid;justify-items:center;align-items:center}.wrapper.svelte-dk7jlv .hero.svelte-dk7jlv{height:100vh;width:100%;display:grid;justify-items:center;align-items:center;grid-auto-rows:max-content;grid-row-gap:3rem;padding-top:5rem}.wrapper.svelte-dk7jlv .hero .settings.svelte-dk7jlv{z-index:10;position:absolute;top:0;right:0;color:#fafafa;font-size:1rem;padding:1.5rem}.wrapper.svelte-dk7jlv .hero .settings .home.svelte-dk7jlv{margin-right:7px}.wrapper.svelte-dk7jlv .hero .settings .btn.svelte-dk7jlv{user-select:none;cursor:pointer;color:rgba(255, 255, 255, 0.8)}.wrapper.svelte-dk7jlv .hero .settings .btn.showSettings.svelte-dk7jlv{color:white}@media not all and (pointer: coarse){.wrapper.svelte-dk7jlv .hero .settings .btn.svelte-dk7jlv:hover{color:white}}.wrapper.svelte-dk7jlv .hero .title.svelte-dk7jlv{z-index:10;position:absolute;top:0;background-color:rgba(0, 0, 0, 0.4);color:#fafafa;font-size:1.5rem;padding:1rem;border-radius:3px;cursor:pointer}@media not all and (pointer: coarse){.wrapper.svelte-dk7jlv .hero .title.svelte-dk7jlv:hover{background-color:rgba(0, 0, 0, 0.8)}}.wrapper.svelte-dk7jlv .hero .title .logo.svelte-dk7jlv{user-select:none;cursor:pointer;top:5px;position:relative;margin-right:9px}.wrapper.svelte-dk7jlv .hero .title .logo img.svelte-dk7jlv{height:2rem}.wrapper.svelte-dk7jlv .hero .title.svelte-dk7jlv svg{margin-right:10px;top:3px;position:relative}.wrapper.svelte-dk7jlv .hero .title .subtitle.svelte-dk7jlv{margin-top:1rem;font-size:1rem;color:rgb(224.5, 224.5, 224.5)}.wrapper.svelte-dk7jlv .hero .title .subtitle p.sub.svelte-dk7jlv{margin:0}.wrapper.svelte-dk7jlv .hero .title .filter span.svelte-dk7jlv{font-size:1rem;margin-right:10px}.wrapper.svelte-dk7jlv .hero .title .filter input.svelte-dk7jlv{padding-left:5px;padding-right:5px;border:1px solid rgba(255, 255, 255, 0.6);background-color:rgba(0, 0, 0, 0);color:white;height:1.5rem}.wrapper.svelte-dk7jlv .hero .imgwrapper.svelte-dk7jlv{display:grid;grid-gap:2rem;justify-content:center;align-content:center}.wrapper.svelte-dk7jlv .hero .imgwrapper .media.svelte-dk7jlv{justify-self:center}.wrapper.svelte-dk7jlv .hero .imgwrapper .media img.svelte-dk7jlv{max-width:100%}.wrapper.svelte-dk7jlv .hero .imgwrapper .media video.svelte-dk7jlv{max-width:100%}.tooltip.svelte-dk7jlv.svelte-dk7jlv{position:relative;z-index:2;cursor:pointer}.tooltip.svelte-dk7jlv.svelte-dk7jlv:before,.tooltip.svelte-dk7jlv.svelte-dk7jlv:after{visibility:hidden;opacity:0;pointer-events:none}.tooltip.svelte-dk7jlv.svelte-dk7jlv:before{position:absolute;bottom:120%;left:50%;margin-bottom:5px;margin-left:-30px;padding:5px 4px;width:60px;border-radius:3px;background-color:black;color:#fff;background-color:rgba(255, 255, 255, 0.9);color:black;content:attr(data-tooltip);text-align:center;font-size:0.8rem;line-height:1.2}.tooltip.svelte-dk7jlv.svelte-dk7jlv:after{position:absolute;bottom:120%;left:50%;margin-left:-5px;width:0;border-top:5px solid #000;border-top:5px solid hsla(0, 0%, 20%, 0.9);border-right:5px solid transparent;border-left:5px solid transparent;content:\" \";font-size:0;line-height:0}.tooltip.svelte-dk7jlv.svelte-dk7jlv:hover:before,.tooltip.svelte-dk7jlv.svelte-dk7jlv:hover:after{visibility:visible;opacity:1}",
+	map: "{\"version\":3,\"file\":\"download.svelte\",\"sources\":[\"download.svelte\"],\"sourcesContent\":[\"<script>\\n  import Icon from \\\"fa-svelte/src/Icon.svelte\\\";\\n  import { faCloudDownloadAlt as faDownload } from \\\"@fortawesome/free-solid-svg-icons/faCloudDownloadAlt\\\";\\n  import { faCog as faSettings } from \\\"@fortawesome/free-solid-svg-icons/faCog\\\";\\n  import { faHome } from \\\"@fortawesome/free-solid-svg-icons/faHome\\\";\\n\\n  import Settings from \\\"../components/Settings.svelte\\\";\\n\\n  import { favorite } from \\\"../_prefs\\\";\\n  favorite.useLocalStorage({});\\n\\n  let filterValue;\\n  let displayposts;\\n\\n  let showSettings = false;\\n\\n  function toggleSettings() {\\n    showSettings = !showSettings;\\n  }\\n\\n  $: {\\n    let tmp;\\n    if (filterValue) {\\n      tmp = Object.entries($favorite).filter((item) => {\\n        let details = item[1];\\n\\n        // poor mans search\\n        // Find all the `values`, make a giant string and substring match\\n        return Object.values(details).join(\\\" \\\").includes(filterValue);\\n      });\\n      displayposts = tmp;\\n    } else {\\n      displayposts = $favorite ? Object.entries($favorite) : [];\\n    }\\n  }\\n</script>\\n\\n<svelte:head>\\n  <title>tumblrpx - download</title>\\n</svelte:head>\\n\\n<div class=\\\"wrapper\\\"><div class=\\\"hero\\\"><div class=\\\"title\\\"><span class=\\\"logo\\\"><img alt=\\\"tumblrpx logo\\\" src=\\\"logo-192.png\\\"></span>tumblrpx download {$favorite ? `(${Object.keys($favorite).length} items)` : '' }<div class=\\\"subtitle\\\"><p class=\\\"sub\\\">Right click on the page (not on any image) > Save as > Select \\\"Webpage, Complete\\\".</p><p class=\\\"sub\\\">Alternatively, hit Ctrl+S > Select \\\"Webpage, Complete\\\"</p></div><div class=\\\"filter\\\"><span>Filter ({displayposts.length})</span><input bind:value=\\\"{filterValue}\\\" type=\\\"text\\\"></div></div><div class=\\\"settings\\\"><a class=\\\"home\\\" rel=\\\"prefetch\\\" href=\\\"/home\\\"><span class=\\\"btn tooltip\\\" data-tooltip=\\\"Home\\\"><Icon icon=\\\"{faHome}\\\"></Icon></span></a><span class=\\\"btn\\\" on:click=\\\"{toggleSettings}\\\" class:showSettings=\\\"{showSettings}\\\"><Icon icon=\\\"{faSettings}\\\"></Icon></span><Settings {showSettings}></Settings></div><div class=\\\"imgwrapper\\\">{#each displayposts as [url, post]}{#if post.is_album}{#each post.preview.img.album as album}{#if album.is_image}<div class=\\\"media\\\"><img alt=\\\"image\\\" src=\\\"{album.hires}\\\"></div>{:else}<div class=\\\"media\\\"><video autoplay loop playsinline muted><source src=\\\"{album.hires}\\\"></video></div>{/if}{/each}{:else if post.is_image}<div class=\\\"media\\\"><img alt=\\\"image\\\" src=\\\"{url}\\\"></div>{:else if post.is_video}<div class=\\\"media\\\"><video autoplay loop playsinline muted>{#if post.preview.vid.webm}<source src=\\\"{post.preview.vid.webm}\\\">{/if}{#if post.preview.vid.mp4}<source src=\\\"{post.preview.vid.mp4}\\\">{/if}</video></div>{/if}{/each}</div></div></div>\\n\\n<style lang=\\\"sass\\\">.wrapper {\\n  height: 100vh;\\n  display: grid;\\n  justify-items: center;\\n  align-items: center;\\n}\\n.wrapper .hero {\\n  height: 100vh;\\n  width: 100%;\\n  display: grid;\\n  justify-items: center;\\n  align-items: center;\\n  grid-auto-rows: max-content;\\n  grid-row-gap: 3rem;\\n  padding-top: 5rem;\\n}\\n.wrapper .hero .settings {\\n  z-index: 10;\\n  position: absolute;\\n  top: 0;\\n  right: 0;\\n  color: #fafafa;\\n  font-size: 1rem;\\n  padding: 1.5rem;\\n}\\n.wrapper .hero .settings .home {\\n  margin-right: 7px;\\n}\\n.wrapper .hero .settings .btn {\\n  user-select: none;\\n  cursor: pointer;\\n  color: rgba(255, 255, 255, 0.8);\\n}\\n.wrapper .hero .settings .btn.showSettings {\\n  color: white;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .settings .btn:hover {\\n    color: white;\\n  }\\n}\\n.wrapper .hero .title {\\n  z-index: 10;\\n  position: absolute;\\n  top: 0;\\n  background-color: rgba(0, 0, 0, 0.4);\\n  color: #fafafa;\\n  font-size: 1.5rem;\\n  padding: 1rem;\\n  border-radius: 3px;\\n  cursor: pointer;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .title:hover {\\n    background-color: rgba(0, 0, 0, 0.8);\\n  }\\n}\\n.wrapper .hero .title .logo {\\n  user-select: none;\\n  cursor: pointer;\\n  top: 5px;\\n  position: relative;\\n  margin-right: 9px;\\n}\\n.wrapper .hero .title .logo img {\\n  height: 2rem;\\n}\\n.wrapper .hero .title :global(svg) {\\n  margin-right: 10px;\\n  top: 3px;\\n  position: relative;\\n}\\n.wrapper .hero .title .subtitle {\\n  margin-top: 1rem;\\n  font-size: 1rem;\\n  color: rgb(224.5, 224.5, 224.5);\\n}\\n.wrapper .hero .title .subtitle p.sub {\\n  margin: 0;\\n}\\n.wrapper .hero .title .filter span {\\n  font-size: 1rem;\\n  margin-right: 10px;\\n}\\n.wrapper .hero .title .filter input {\\n  padding-left: 5px;\\n  padding-right: 5px;\\n  border: 1px solid rgba(255, 255, 255, 0.6);\\n  background-color: rgba(0, 0, 0, 0);\\n  color: white;\\n  height: 1.5rem;\\n}\\n.wrapper .hero .imgwrapper {\\n  display: grid;\\n  grid-gap: 2rem;\\n  justify-content: center;\\n  align-content: center;\\n}\\n.wrapper .hero .imgwrapper .media {\\n  justify-self: center;\\n}\\n.wrapper .hero .imgwrapper .media img {\\n  max-width: 100%;\\n}\\n.wrapper .hero .imgwrapper .media video {\\n  max-width: 100%;\\n}\\n\\n.tooltip {\\n  position: relative;\\n  z-index: 2;\\n  cursor: pointer;\\n}\\n\\n.tooltip:before, .tooltip:after {\\n  visibility: hidden;\\n  opacity: 0;\\n  pointer-events: none;\\n}\\n.tooltip:before {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-bottom: 5px;\\n  margin-left: -30px;\\n  padding: 5px 4px;\\n  width: 60px;\\n  border-radius: 3px;\\n  background-color: black;\\n  color: #fff;\\n  background-color: rgba(255, 255, 255, 0.9);\\n  color: black;\\n  content: attr(data-tooltip);\\n  text-align: center;\\n  font-size: 0.8rem;\\n  line-height: 1.2;\\n}\\n.tooltip:after {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-left: -5px;\\n  width: 0;\\n  border-top: 5px solid #000;\\n  border-top: 5px solid hsla(0, 0%, 20%, 0.9);\\n  border-right: 5px solid transparent;\\n  border-left: 5px solid transparent;\\n  content: \\\" \\\";\\n  font-size: 0;\\n  line-height: 0;\\n}\\n.tooltip:hover:before, .tooltip:hover:after {\\n  visibility: visible;\\n  opacity: 1;\\n}</style>\\n\"],\"names\":[],\"mappings\":\"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\"}"
 };
 
 const Download = create_ssr_component(($$result, $$props, $$bindings, slots) => {
@@ -2724,21 +2910,21 @@ const Download = create_ssr_component(($$result, $$props, $$bindings, slots) => 
 
 	$$unsubscribe_favorite();
 
-	return `${($$result.head += `${($$result.title = `<title>tumblrpx - download</title>`, "")}`, "")}
+	return `${($$result.head += '<!-- HEAD_svelte-9dhkvy_START -->' + `${($$result.title = `<title>tumblrpx - download</title>`, "")}` + '<!-- HEAD_svelte-9dhkvy_END -->', "")}
 
-<div class="${"wrapper svelte-scsxcb"}"><div class="${"hero svelte-scsxcb"}"><div class="${"title svelte-scsxcb"}"><span class="${"logo svelte-scsxcb"}"><img alt="${"tumblrpx logo"}" src="${"logo-192.png"}" class="${"svelte-scsxcb"}"></span>tumblrpx download ${escape($favorite
+<div class="wrapper svelte-dk7jlv"><div class="hero svelte-dk7jlv"><div class="title svelte-dk7jlv"><span class="logo svelte-dk7jlv"><img alt="tumblrpx logo" src="logo-192.png" class="svelte-dk7jlv"></span>tumblrpx download ${escape($favorite
 	? `(${Object.keys($favorite).length} items)`
-	: '')}<div class="${"subtitle svelte-scsxcb"}"><p class="${"sub svelte-scsxcb"}">Right click on the page (not on any image) &gt; Save as &gt; Select &quot;Webpage, Complete&quot;.</p><p class="${"sub svelte-scsxcb"}">Alternatively, hit Ctrl+S &gt; Select &quot;Webpage, Complete&quot;</p></div><div class="${"filter"}"><span class="${"svelte-scsxcb"}">Filter (${escape(displayposts.length)})</span><input type="${"text"}" class="${"svelte-scsxcb"}"${add_attribute("value", filterValue, 0)}></div></div><div class="${"settings svelte-scsxcb"}"><a class="${"home svelte-scsxcb"}" rel="${"prefetch"}" href="${"/home"}"><span class="${"btn tooltip svelte-scsxcb"}" data-tooltip="${"Home"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faHome$1.faHome }, {}, {})}</span></a><span class="${["btn svelte-scsxcb", ""].join(' ').trim()}">${validate_component(Icon, "Icon").$$render($$result, { icon: faCog$1.faCog }, {}, {})}</span>${validate_component(Settings, "Settings").$$render($$result, { showSettings }, {}, {})}</div><div class="${"imgwrapper svelte-scsxcb"}">${each(displayposts, ([url, post]) => {
+	: '')}<div class="subtitle svelte-dk7jlv"><p class="sub svelte-dk7jlv">Right click on the page (not on any image) &gt; Save as &gt; Select &quot;Webpage, Complete&quot;.</p><p class="sub svelte-dk7jlv">Alternatively, hit Ctrl+S &gt; Select &quot;Webpage, Complete&quot;</p></div><div class="filter"><span class="svelte-dk7jlv">Filter (${escape(displayposts.length)})</span><input type="text" class="svelte-dk7jlv"${add_attribute("value", filterValue, 0)}></div></div><div class="settings svelte-dk7jlv"><a class="home svelte-dk7jlv" rel="prefetch" href="/home"><span class="btn tooltip svelte-dk7jlv" data-tooltip="Home">${validate_component(Icon, "Icon").$$render($$result, { icon: faHome$1.faHome }, {}, {})}</span></a><span class="${["btn svelte-dk7jlv", ""].join(' ').trim()}">${validate_component(Icon, "Icon").$$render($$result, { icon: faCog$1.faCog }, {}, {})}</span>${validate_component(Settings, "Settings").$$render($$result, { showSettings }, {}, {})}</div><div class="imgwrapper svelte-dk7jlv">${each(displayposts, ([url, post]) => {
 		return `${post.is_album
 		? `${each(post.preview.img.album, album => {
 				return `${album.is_image
-				? `<div class="${"media svelte-scsxcb"}"><img alt="${"image"}"${add_attribute("src", album.hires, 0)} class="${"svelte-scsxcb"}"></div>`
-				: `<div class="${"media svelte-scsxcb"}"><video autoplay loop playsinline muted class="${"svelte-scsxcb"}"><source${add_attribute("src", album.hires, 0)}></video></div>`}`;
+				? `<div class="media svelte-dk7jlv"><img alt="image"${add_attribute("src", album.hires, 0)} class="svelte-dk7jlv"></div>`
+				: `<div class="media svelte-dk7jlv"><video autoplay loop playsinline muted class="svelte-dk7jlv"><source${add_attribute("src", album.hires, 0)}></video></div>`}`;
 			})}`
 		: `${post.is_image
-			? `<div class="${"media svelte-scsxcb"}"><img alt="${"image"}"${add_attribute("src", url, 0)} class="${"svelte-scsxcb"}"></div>`
+			? `<div class="media svelte-dk7jlv"><img alt="image"${add_attribute("src", url, 0)} class="svelte-dk7jlv"></div>`
 			: `${post.is_video
-				? `<div class="${"media svelte-scsxcb"}"><video autoplay loop playsinline muted class="${"svelte-scsxcb"}">${post.preview.vid.webm
+				? `<div class="media svelte-dk7jlv"><video autoplay loop playsinline muted class="svelte-dk7jlv">${post.preview.vid.webm
 					? `<source${add_attribute("src", post.preview.vid.webm, 0)}>`
 					: ``}${post.preview.vid.mp4
 					? `<source${add_attribute("src", post.preview.vid.mp4, 0)}>`
@@ -2752,16 +2938,16 @@ var component_1 = /*#__PURE__*/Object.freeze({
     'default': Download
 });
 
-/* src/routes/health.svelte generated by Svelte v3.46.2 */
+/* src/routes/health.svelte generated by Svelte v3.59.2 */
 
 const css$1 = {
 	code: "p.svelte-1nb2zc2{color:white}",
-	map: "{\"version\":3,\"file\":\"health.svelte\",\"sources\":[\"health.svelte\"],\"sourcesContent\":[\"\\n  <p>OK</p>\\n\\n\\n<style>\\n  p {\\n    color: white;\\n  }\\n</style>\\n\"],\"names\":[],\"mappings\":\"AAKE,CAAC,eAAC,CAAC,AACD,KAAK,CAAE,KAAK,AACd,CAAC\"}"
+	map: "{\"version\":3,\"file\":\"health.svelte\",\"sources\":[\"health.svelte\"],\"sourcesContent\":[\"\\n  <p>OK</p>\\n\\n\\n<style>\\n  p {\\n    color: white;\\n  }\\n</style>\\n\"],\"names\":[],\"mappings\":\"AAKE,gBAAE,CACA,KAAK,CAAE,KACT\"}"
 };
 
 const Health = create_ssr_component(($$result, $$props, $$bindings, slots) => {
 	$$result.css.add(css$1);
-	return `<p class="${"svelte-1nb2zc2"}">OK</p>`;
+	return `<p class="svelte-1nb2zc2">OK</p>`;
 });
 
 var component_2 = /*#__PURE__*/Object.freeze({
@@ -2769,102 +2955,28 @@ var component_2 = /*#__PURE__*/Object.freeze({
     'default': Health
 });
 
-var faTimesCircle = createCommonjsModule$1(function (module, exports) {
-Object.defineProperty(exports, '__esModule', { value: true });
-var prefix = 'fas';
-var iconName = 'times-circle';
-var width = 512;
-var height = 512;
-var ligatures = [];
-var unicode = 'f057';
-var svgPathData = 'M256 8C119 8 8 119 8 256s111 248 248 248 248-111 248-248S393 8 256 8zm121.6 313.1c4.7 4.7 4.7 12.3 0 17L338 377.6c-4.7 4.7-12.3 4.7-17 0L256 312l-65.1 65.6c-4.7 4.7-12.3 4.7-17 0L134.4 338c-4.7-4.7-4.7-12.3 0-17l65.6-65-65.6-65.1c-4.7-4.7-4.7-12.3 0-17l39.6-39.6c4.7-4.7 12.3-4.7 17 0l65 65.7 65.1-65.6c4.7-4.7 12.3-4.7 17 0l39.6 39.6c4.7 4.7 4.7 12.3 0 17L312 256l65.6 65.1z';
-
-exports.definition = {
-  prefix: prefix,
-  iconName: iconName,
-  icon: [
-    width,
-    height,
-    ligatures,
-    unicode,
-    svgPathData
-  ]};
-
-exports.faTimesCircle = exports.definition;
-exports.prefix = prefix;
-exports.iconName = iconName;
-exports.width = width;
-exports.height = height;
-exports.ligatures = ligatures;
-exports.unicode = unicode;
-exports.svgPathData = svgPathData;
-});
-
-var faTimesCircle$1 = faTimesCircle;
-
-/* src/routes/home.svelte generated by Svelte v3.46.2 */
-
-const css = {
-	code: ".wrapper.svelte-p55m9z.svelte-p55m9z{height:100vh;display:grid;justify-items:center;align-items:center}.wrapper.svelte-p55m9z .hero.svelte-p55m9z{height:100vh;width:100%;display:grid;justify-items:center;align-items:center;grid-auto-rows:max-content;grid-row-gap:3rem;padding-top:5rem}.wrapper.svelte-p55m9z .hero .settings.svelte-p55m9z{z-index:10;position:absolute;top:0;right:0;color:#fafafa;font-size:1rem;padding:1.5rem}.wrapper.svelte-p55m9z .hero .settings .btn.svelte-p55m9z{user-select:none;cursor:pointer;color:rgba(255, 255, 255, 0.8)}.wrapper.svelte-p55m9z .hero .settings .btn.showSettings.svelte-p55m9z{color:white}@media not all and (pointer: coarse){.wrapper.svelte-p55m9z .hero .settings .btn.svelte-p55m9z:hover{color:white}}.wrapper.svelte-p55m9z .hero .title.svelte-p55m9z{z-index:10;position:absolute;top:0;color:#fafafa;font-size:1.5rem;max-width:90%;padding:1rem;border-radius:3px;cursor:pointer}.wrapper.svelte-p55m9z .hero .title .logo.svelte-p55m9z{user-select:none;cursor:pointer;top:5px;position:relative;margin-right:9px}.wrapper.svelte-p55m9z .hero .title .logo img.svelte-p55m9z{height:2rem}.wrapper.svelte-p55m9z .hero .block.svelte-p55m9z{color:#fafafa;padding:1rem;width:100%;align-self:start}.wrapper.svelte-p55m9z .hero .block .heading.svelte-p55m9z{font-size:1.5rem}.wrapper.svelte-p55m9z .hero .block .heading .icon.svelte-p55m9z{top:3px;position:relative;margin-left:8px}.wrapper.svelte-p55m9z .hero .block .heading .icon.favorite.svelte-p55m9z{color:#fbbc04}.wrapper.svelte-p55m9z .hero .block .links.svelte-p55m9z{display:none}.wrapper.svelte-p55m9z .hero .block .items.svelte-p55m9z{display:grid;grid-template-columns:repeat(auto-fill, minmax(250px, 1fr));grid-gap:10px;margin-top:5px}.wrapper.svelte-p55m9z .hero .block .items .itemwrapper.explore .item.svelte-p55m9z{height:5rem}.wrapper.svelte-p55m9z .hero .block .items .itemwrapper.noitems.svelte-p55m9z{color:#aeaeae;background-color:#1a1a1a;grid-column:1/-1;border-radius:3px;margin-top:1rem;display:grid;justify-content:center}.wrapper.svelte-p55m9z .hero .block .items .itemwrapper.noitems .item.svelte-p55m9z{padding:4rem}.wrapper.svelte-p55m9z .hero .block .items .itemwrapper.noitems .item .inlineicon.svelte-p55m9z{margin:0 4px;top:2px;position:relative;color:white}.wrapper.svelte-p55m9z .hero .block .items .itemwrapper.noitems .item .key.svelte-p55m9z{color:#aeaeae;margin:0 4px;border:1px solid #aeaeae;border-radius:3px;top:-1px;position:relative;line-height:1.3rem;padding:0 5px}@media not all and (pointer: coarse){.wrapper.svelte-p55m9z .hero .block .items .itemwrapper:hover .icon.svelte-p55m9z{opacity:1}}@media not all and (pointer: coarse){.wrapper.svelte-p55m9z .hero .block .items .itemwrapper:hover span.svelte-p55m9z{opacity:1 !important}}.wrapper.svelte-p55m9z .hero .block .items .itemwrapper .icon.svelte-p55m9z{position:relative;float:right;margin:1.1rem;opacity:0;color:#fbbc04;font-size:1.3rem}.wrapper.svelte-p55m9z .hero .block .items .itemwrapper a.svelte-p55m9z{color:#fafafa;text-decoration:none}.wrapper.svelte-p55m9z .hero .block .items .itemwrapper a .item.svelte-p55m9z{padding:1rem;height:10rem;background-size:cover;background-position:center;border-radius:3px}.wrapper.svelte-p55m9z .hero .block .items .itemwrapper a .item .subreddit span.svelte-p55m9z{opacity:0}.wrapper.svelte-p55m9z .hero .block .items .itemwrapper a .item span.svelte-p55m9z{background-color:black;padding:0.3rem;border-radius:3px}.tooltip.svelte-p55m9z.svelte-p55m9z{position:relative;z-index:2;cursor:pointer}.tooltip.svelte-p55m9z.svelte-p55m9z:before,.tooltip.svelte-p55m9z.svelte-p55m9z:after{visibility:hidden;opacity:0;pointer-events:none}.tooltip.svelte-p55m9z.svelte-p55m9z:before{position:absolute;bottom:120%;left:50%;margin-bottom:5px;margin-left:-30px;padding:5px 4px;width:60px;border-radius:3px;background-color:black;color:#fff;background-color:rgba(255, 255, 255, 0.9);color:black;content:attr(data-tooltip);text-align:center;font-size:0.8rem;line-height:1.2}.tooltip.svelte-p55m9z.svelte-p55m9z:after{position:absolute;bottom:120%;left:50%;margin-left:-5px;width:0;border-top:5px solid #000;border-top:5px solid rgba(51, 51, 51, 0.9);border-right:5px solid transparent;border-left:5px solid transparent;content:\" \";font-size:0;line-height:0}.tooltip.svelte-p55m9z.svelte-p55m9z:hover:before,.tooltip.svelte-p55m9z.svelte-p55m9z:hover:after{visibility:visible;opacity:1}",
-	map: "{\"version\":3,\"file\":\"home.svelte\",\"sources\":[\"home.svelte\"],\"sourcesContent\":[\"<script>\\n  import Icon from \\\"fa-svelte/src/Icon.svelte\\\";\\n  import { faCog as faSettings } from \\\"@fortawesome/free-solid-svg-icons/faCog\\\";\\n\\n  import { faCloudDownloadAlt as faDownload } from \\\"@fortawesome/free-solid-svg-icons/faCloudDownloadAlt\\\";\\n  import { faEye as faSlideshow } from \\\"@fortawesome/free-solid-svg-icons/faEye\\\";\\n  import { faTimesCircle as faClose } from \\\"@fortawesome/free-solid-svg-icons/faTimesCircle\\\";\\n  import { faPlusCircle } from \\\"@fortawesome/free-solid-svg-icons/faPlusCircle\\\";\\n  import { faStar as faFav } from \\\"@fortawesome/free-solid-svg-icons/faStar\\\";\\n\\n  import Settings from \\\"../components/Settings.svelte\\\";\\n\\n  import { goto as ahref } from \\\"@sapper/app\\\";\\n\\n  import { favorite } from \\\"../_prefs\\\";\\n  favorite.useLocalStorage({});\\n\\n  let showSettings = false;\\n\\n  let exploreTumblrUsers = [\\n    { color: \\\"lightpink\\\", url: \\\"t/staff\\\" },\\n    { color: \\\"lightsalmon\\\", url: \\\"t/tumblr\\\" },\\n    { color: \\\"peachpuff\\\", url: \\\"t/art\\\" },\\n    { color: \\\"lavender\\\", url: \\\"t/photography\\\" },\\n    { color: \\\"palegreen\\\", url: \\\"t/design\\\" },\\n    { color: \\\"turquoise\\\", url: \\\"t/fashion\\\" },\\n    { color: \\\"wheat\\\", url: \\\"t/food\\\" },\\n    { color: \\\"lightskyblue\\\", url: \\\"t/music\\\" },\\n    { color: \\\"tomato\\\", url: \\\"t/travel\\\" }\\n  ];\\n\\n  function toggleSettings() {\\n    showSettings = !showSettings;\\n  }\\n\\n  let displayposts = [];\\n  let musers = [];\\n\\n  $: displayposts = $favorite ? Object.entries($favorite) : [];\\n  $: musers = []; // Multi-user not implemented yet\\n  $: slideshowurl = \\\"\\\"; // Multi-user not implemented yet\\n\\n  async function downloadFiles() {\\n    window.open(\\\"/download\\\", \\\"_blank\\\");\\n  }\\n\\n  function openSlideshow() {\\n    ahref(slideshowurl);\\n  }\\n\\n  function removeFav(url) {\\n    $favorite[url] = undefined;\\n    $favorite = JSON.parse(JSON.stringify($favorite));\\n\\n    favorite.set($favorite);\\n  }\\n</script>\\n\\n<svelte:head>\\n  <title>redditpx - home</title>\\n</svelte:head>\\n\\n<div class=\\\"wrapper\\\"><div class=\\\"hero\\\"><div class=\\\"title\\\"><span class=\\\"logo\\\"><img alt=\\\"tumblrpx logo\\\" src=\\\"logo-192.png\\\"></span>tumblrpx</div><div class=\\\"settings\\\"><span class=\\\"btn\\\" on:click=\\\"{toggleSettings}\\\" class:showSettings=\\\"{showSettings}\\\"><Icon icon=\\\"{faSettings}\\\"></Icon></span><Settings {showSettings}></Settings></div><div class=\\\"block multiuser\\\"><div class=\\\"heading\\\">Multi-user {\\\"(\\\" + musers.length + \\\")\\\"}{#if musers.length}<span class=\\\"icon tooltip\\\" on:click=\\\"{openSlideshow}\\\" data-tooltip=\\\"start slideshow\\\" class:favorite=\\\"{musers.length}\\\"><Icon icon=\\\"{faSlideshow}\\\"></Icon></span>{/if}</div><div class=\\\"items\\\">{#each musers as [muser, mrdetails]}<div class=\\\"itemwrapper\\\"><a href=\\\"{`/t/${muser}`}\\\" rel=\\\"prefetch\\\"><div class=\\\"item\\\" style=\\\"background-image: url(&quot;{mrdetails.preview}&quot;)\\\"><span>{muser}</span></div></a></div>{:else}<div class=\\\"itemwrapper noitems\\\"><div class=\\\"item\\\"><span>Add to multi-user using</span><span class=\\\"inlineicon\\\"><Icon icon=\\\"{faPlusCircle}\\\"></Icon></span><span>or using shortcut</span><span class=\\\"key\\\">m</span></div></div>{/each}</div></div><div class=\\\"block favs\\\"><div class=\\\"heading\\\">Favorites {\\\"(\\\" + displayposts.length + \\\")\\\"}{#if displayposts.length}<span class=\\\"icon tooltip\\\" on:click=\\\"{downloadFiles}\\\" data-tooltip=\\\"download all\\\" class:favorite=\\\"{displayposts.length}\\\"><Icon icon=\\\"{faDownload}\\\"></Icon></span>{/if}</div><div class=\\\"items\\\">{#each displayposts as [url, post]}<div class=\\\"itemwrapper\\\"><span class=\\\"icon tooltip\\\" on:click|stopPropagation|preventDefault=\\\"{function() {removeFav(url)}}\\\" data-tooltip=\\\"remove\\\"><Icon icon=\\\"{faClose}\\\"></Icon></span><a href=\\\"{post.url}\\\" target=\\\"_blank\\\"><div class=\\\"item\\\" style=\\\"background-image: url(&quot;{post.preview.img.default}&quot;)\\\"><a class=\\\"subreddit\\\" href=\\\"{`/r/${post.subreddit}`}\\\"><span>{\\\"r/\\\" + post.subreddit}</span></a></div></a></div>{:else}<div class=\\\"itemwrapper noitems\\\"><div class=\\\"item\\\"><span>Add to favorites using</span><span class=\\\"inlineicon\\\"><Icon icon=\\\"{faFav}\\\"></Icon></span><span>or using shortcut</span><span class=\\\"key\\\">x</span></div></div>{/each}</div></div><div class=\\\"block explore\\\"><div class=\\\"heading\\\">Explore</div><div class=\\\"items\\\">{#each exploreSubreddits as subreddit}<div class=\\\"itemwrapper explore\\\"><a href=\\\"{`/${subreddit.url}`}\\\" rel=\\\"prefetch\\\"><div class=\\\"item\\\" style=\\\"background-color: {subreddit.color}\\\"><span>{subreddit.url}</span></div></a></div>{/each}</div><div class=\\\"links\\\"><a href=\\\"/t/username\\\"></a></div></div></div></div>\\n\\n<style lang=\\\"sass\\\">.wrapper {\\n  height: 100vh;\\n  display: grid;\\n  justify-items: center;\\n  align-items: center;\\n}\\n.wrapper .hero {\\n  height: 100vh;\\n  width: 100%;\\n  display: grid;\\n  justify-items: center;\\n  align-items: center;\\n  grid-auto-rows: max-content;\\n  grid-row-gap: 3rem;\\n  padding-top: 5rem;\\n}\\n.wrapper .hero .settings {\\n  z-index: 10;\\n  position: absolute;\\n  top: 0;\\n  right: 0;\\n  color: #fafafa;\\n  font-size: 1rem;\\n  padding: 1.5rem;\\n}\\n.wrapper .hero .settings .btn {\\n  user-select: none;\\n  cursor: pointer;\\n  color: rgba(255, 255, 255, 0.8);\\n}\\n.wrapper .hero .settings .btn.showSettings {\\n  color: white;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .settings .btn:hover {\\n    color: white;\\n  }\\n}\\n.wrapper .hero .title {\\n  z-index: 10;\\n  position: absolute;\\n  top: 0;\\n  color: #fafafa;\\n  font-size: 1.5rem;\\n  max-width: 90%;\\n  padding: 1rem;\\n  border-radius: 3px;\\n  cursor: pointer;\\n}\\n.wrapper .hero .title .logo {\\n  user-select: none;\\n  cursor: pointer;\\n  top: 5px;\\n  position: relative;\\n  margin-right: 9px;\\n}\\n.wrapper .hero .title .logo img {\\n  height: 2rem;\\n}\\n.wrapper .hero .block {\\n  color: #fafafa;\\n  padding: 1rem;\\n  width: 100%;\\n  align-self: start;\\n}\\n.wrapper .hero .block .heading {\\n  font-size: 1.5rem;\\n}\\n.wrapper .hero .block .heading .icon {\\n  top: 3px;\\n  position: relative;\\n  margin-left: 8px;\\n}\\n.wrapper .hero .block .heading .icon.favorite {\\n  color: #fbbc04;\\n}\\n.wrapper .hero .block .links {\\n  display: none;\\n}\\n.wrapper .hero .block .items {\\n  display: grid;\\n  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));\\n  grid-gap: 10px;\\n  margin-top: 5px;\\n}\\n.wrapper .hero .block .items .itemwrapper.explore .item {\\n  height: 5rem;\\n}\\n.wrapper .hero .block .items .itemwrapper.noitems {\\n  color: #aeaeae;\\n  background-color: #1a1a1a;\\n  grid-column: 1/-1;\\n  border-radius: 3px;\\n  margin-top: 1rem;\\n  display: grid;\\n  justify-content: center;\\n}\\n.wrapper .hero .block .items .itemwrapper.noitems .item {\\n  padding: 4rem;\\n}\\n.wrapper .hero .block .items .itemwrapper.noitems .item .inlineicon {\\n  margin: 0 4px;\\n  top: 2px;\\n  position: relative;\\n  color: white;\\n}\\n.wrapper .hero .block .items .itemwrapper.noitems .item .key {\\n  color: #aeaeae;\\n  margin: 0 4px;\\n  border: 1px solid #aeaeae;\\n  border-radius: 3px;\\n  top: -1px;\\n  position: relative;\\n  line-height: 1.3rem;\\n  padding: 0 5px;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .block .items .itemwrapper:hover .icon {\\n    opacity: 1;\\n  }\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .block .items .itemwrapper:hover span {\\n    opacity: 1 !important;\\n  }\\n}\\n.wrapper .hero .block .items .itemwrapper .icon {\\n  position: relative;\\n  float: right;\\n  margin: 1.1rem;\\n  opacity: 0;\\n  color: #fbbc04;\\n  font-size: 1.3rem;\\n}\\n.wrapper .hero .block .items .itemwrapper a {\\n  color: #fafafa;\\n  text-decoration: none;\\n}\\n.wrapper .hero .block .items .itemwrapper a .item {\\n  padding: 1rem;\\n  height: 10rem;\\n  background-size: cover;\\n  background-position: center;\\n  border-radius: 3px;\\n}\\n.wrapper .hero .block .items .itemwrapper a .item .subreddit span {\\n  opacity: 0;\\n}\\n.wrapper .hero .block .items .itemwrapper a .item span {\\n  background-color: black;\\n  padding: 0.3rem;\\n  border-radius: 3px;\\n}\\n\\n.tooltip {\\n  position: relative;\\n  z-index: 2;\\n  cursor: pointer;\\n}\\n\\n.tooltip:before, .tooltip:after {\\n  visibility: hidden;\\n  opacity: 0;\\n  pointer-events: none;\\n}\\n.tooltip:before {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-bottom: 5px;\\n  margin-left: -30px;\\n  padding: 5px 4px;\\n  width: 60px;\\n  border-radius: 3px;\\n  background-color: black;\\n  color: #fff;\\n  background-color: rgba(255, 255, 255, 0.9);\\n  color: black;\\n  content: attr(data-tooltip);\\n  text-align: center;\\n  font-size: 0.8rem;\\n  line-height: 1.2;\\n}\\n.tooltip:after {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-left: -5px;\\n  width: 0;\\n  border-top: 5px solid #000;\\n  border-top: 5px solid rgba(51, 51, 51, 0.9);\\n  border-right: 5px solid transparent;\\n  border-left: 5px solid transparent;\\n  content: \\\" \\\";\\n  font-size: 0;\\n  line-height: 0;\\n}\\n.tooltip:hover:before, .tooltip:hover:after {\\n  visibility: visible;\\n  opacity: 1;\\n}</style>\\n\"],\"names\":[],\"mappings\":\"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\"}"
-};
-
-const Home = create_ssr_component(($$result, $$props, $$bindings, slots) => {
-	let $favorite, $$unsubscribe_favorite;
-	$$unsubscribe_favorite = subscribe(favorite, value => $favorite = value);
-	favorite.useLocalStorage({});
-	let showSettings = false;
-
-	let displayposts = [];
-	let musers = [];
-
-	$$result.css.add(css);
-	displayposts = $favorite ? Object.entries($favorite) : [];
-	musers = []; // Multi-user not implemented yet
-	$$unsubscribe_favorite();
-
-	return `${($$result.head += `${($$result.title = `<title>redditpx - home</title>`, "")}`, "")}
-
-<div class="${"wrapper svelte-p55m9z"}"><div class="${"hero svelte-p55m9z"}"><div class="${"title svelte-p55m9z"}"><span class="${"logo svelte-p55m9z"}"><img alt="${"tumblrpx logo"}" src="${"logo-192.png"}" class="${"svelte-p55m9z"}"></span>tumblrpx</div><div class="${"settings svelte-p55m9z"}"><span class="${["btn svelte-p55m9z", ""].join(' ').trim()}">${validate_component(Icon, "Icon").$$render($$result, { icon: faCog$1.faCog }, {}, {})}</span>${validate_component(Settings, "Settings").$$render($$result, { showSettings }, {}, {})}</div><div class="${"block multiuser svelte-p55m9z"}"><div class="${"heading svelte-p55m9z"}">Multi-user ${escape("(" + musers.length + ")")}${musers.length
-	? `<span class="${["icon tooltip svelte-p55m9z", musers.length ? "favorite" : ""].join(' ').trim()}" data-tooltip="${"start slideshow"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faEye$1.faEye }, {}, {})}</span>`
-	: ``}</div><div class="${"items svelte-p55m9z"}">${musers.length
-	? each(musers, ([muser, mrdetails]) => {
-			return `<div class="${"itemwrapper"}"><a${add_attribute("href", `/t/${muser}`, 0)} rel="${"prefetch"}" class="${"svelte-p55m9z"}"><div class="${"item svelte-p55m9z"}" style="${"background-image: url(&quot;" + escape(mrdetails.preview) + "&quot;)"}"><span class="${"svelte-p55m9z"}">${escape(muser)}</span></div></a></div>`;
-		})
-	: `<div class="${"itemwrapper noitems svelte-p55m9z"}"><div class="${"item svelte-p55m9z"}"><span class="${"svelte-p55m9z"}">Add to multi-user using</span><span class="${"inlineicon svelte-p55m9z"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faPlusCircle$1.faPlusCircle }, {}, {})}</span><span class="${"svelte-p55m9z"}">or using shortcut</span><span class="${"key svelte-p55m9z"}">m</span></div></div>`}</div></div><div class="${"block favs svelte-p55m9z"}"><div class="${"heading svelte-p55m9z"}">Favorites ${escape("(" + displayposts.length + ")")}${displayposts.length
-	? `<span class="${["icon tooltip svelte-p55m9z", displayposts.length ? "favorite" : ""].join(' ').trim()}" data-tooltip="${"download all"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faCloudDownloadAlt$1.faCloudDownloadAlt }, {}, {})}</span>`
-	: ``}</div><div class="${"items svelte-p55m9z"}">${displayposts.length
-	? each(displayposts, ([url, post]) => {
-			return `<div class="${"itemwrapper"}"><span class="${"icon tooltip svelte-p55m9z"}" data-tooltip="${"remove"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faTimesCircle$1.faTimesCircle }, {}, {})}</span><a${add_attribute("href", post.url, 0)} target="${"_blank"}" class="${"svelte-p55m9z"}"><div class="${"item svelte-p55m9z"}" style="${"background-image: url(&quot;" + escape(post.preview.img.default) + "&quot;)"}"><a class="${"subreddit svelte-p55m9z"}"${add_attribute("href", `/r/${post.subreddit}`, 0)}><span class="${"svelte-p55m9z"}">${escape("r/" + post.subreddit)}</span></a></div></a></div>`;
-		})
-	: `<div class="${"itemwrapper noitems svelte-p55m9z"}"><div class="${"item svelte-p55m9z"}"><span class="${"svelte-p55m9z"}">Add to favorites using</span><span class="${"inlineicon svelte-p55m9z"}">${validate_component(Icon, "Icon").$$render($$result, { icon: faStar$3.faStar }, {}, {})}</span><span class="${"svelte-p55m9z"}">or using shortcut</span><span class="${"key svelte-p55m9z"}">x</span></div></div>`}</div></div><div class="${"block explore svelte-p55m9z"}"><div class="${"heading svelte-p55m9z"}">Explore</div><div class="${"items svelte-p55m9z"}">${each(exploreSubreddits, subreddit => {
-		return `<div class="${"itemwrapper explore"}"><a${add_attribute("href", `/${subreddit.url}`, 0)} rel="${"prefetch"}" class="${"svelte-p55m9z"}"><div class="${"item svelte-p55m9z"}" style="${"background-color: " + escape(subreddit.color)}"><span class="${"svelte-p55m9z"}">${escape(subreddit.url)}</span></div></a></div>`;
-	})}</div><div class="${"links svelte-p55m9z"}"><a href="${"/t/username"}" class="${"svelte-p55m9z"}"></a></div></div></div></div>`;
-});
-
-var component_3 = /*#__PURE__*/Object.freeze({
-    __proto__: null,
-    'default': Home
-});
-
-/* src/routes/t/[slug]/index.svelte generated by Svelte v3.46.2 */
-const API_KEY$1 = 'ru6b4z2sDMz7h0WyCULiNuqqgDfgubrdQZtZrVUkXQGkzFPTrF';
+/* src/routes/search/[tag].svelte generated by Svelte v3.59.2 */
 
 async function preload$1({ path, params, query }) {
 	if (typeof window === "undefined") return;
-	let blogIdentifier = params.slug;
-	let url = `https://api.tumblr.com/v2/blog/${blogIdentifier}/posts?api_key=${API_KEY$1}&${queryp(query)}`;
-	let { posts, res, after } = await get_tumblr_posts(url);
+	let tag = params.tag;
 
-	return {
-		posts,
-		after,
-		res,
-		slugstr: blogIdentifier
-	};
+	// Check if we have a valid API key before making the request
+	{
+		// Return empty data to let the client handle API key setup
+		return {
+			posts: [],
+			after: null,
+			res: {
+				ok: false,
+				res: "Invalid API key. Please set your Tumblr API key in settings."
+			},
+			slugstr: tag
+		};
+	}
 }
 
-const U5Bslugu5D$1 = create_ssr_component(($$result, $$props, $$bindings, slots) => {
+const U5Btagu5D = create_ssr_component(($$result, $$props, $$bindings, slots) => {
 	let $favorite, $$unsubscribe_favorite;
 	let $layout, $$unsubscribe_layout;
 	let $page, $$unsubscribe_page;
@@ -2900,7 +3012,8 @@ const U5Bslugu5D$1 = create_ssr_component(($$result, $$props, $$bindings, slots)
 				posts,
 				res,
 				after,
-				params: $page.query
+				params: $page.query,
+				pageType: "search"
 			},
 			{},
 			{}
@@ -2908,30 +3021,287 @@ const U5Bslugu5D$1 = create_ssr_component(($$result, $$props, $$bindings, slots)
 	: ``}`;
 });
 
-var component_4 = /*#__PURE__*/Object.freeze({
+var component_3 = /*#__PURE__*/Object.freeze({
     __proto__: null,
-    'default': U5Bslugu5D$1,
+    'default': U5Btagu5D,
     preload: preload$1
 });
 
-/* src/routes/t/[slug]/[slug].svelte generated by Svelte v3.46.2 */
-const API_KEY = 'ru6b4z2sDMz7h0WyCULiNuqqgDfgubrdQZtZrVUkXQGkzFPTrF';
+var faEye = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+var prefix = 'fas';
+var iconName = 'eye';
+var width = 576;
+var height = 512;
+var aliases = [128065];
+var unicode = 'f06e';
+var svgPathData = 'M288 32c-80.8 0-145.5 36.8-192.6 80.6-46.8 43.5-78.1 95.4-93 131.1-3.3 7.9-3.3 16.7 0 24.6 14.9 35.7 46.2 87.7 93 131.1 47.1 43.7 111.8 80.6 192.6 80.6s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1 3.3-7.9 3.3-16.7 0-24.6-14.9-35.7-46.2-87.7-93-131.1-47.1-43.7-111.8-80.6-192.6-80.6zM144 256a144 144 0 1 1 288 0 144 144 0 1 1 -288 0zm144-64c0 35.3-28.7 64-64 64-11.5 0-22.3-3-31.7-8.4-1 10.9-.1 22.1 2.9 33.2 13.7 51.2 66.4 81.6 117.6 67.9s81.6-66.4 67.9-117.6c-12.2-45.7-55.5-74.8-101.1-70.8 5.3 9.3 8.4 20.1 8.4 31.7z';
+
+exports.definition = {
+  prefix: prefix,
+  iconName: iconName,
+  icon: [
+    width,
+    height,
+    aliases,
+    unicode,
+    svgPathData
+  ]};
+
+exports.faEye = exports.definition;
+exports.prefix = prefix;
+exports.iconName = iconName;
+exports.width = width;
+exports.height = height;
+exports.ligatures = aliases;
+exports.unicode = unicode;
+exports.svgPathData = svgPathData;
+exports.aliases = aliases;
+});
+
+var faEye$1 = faEye;
+
+var faCircleXmark = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+var prefix = 'fas';
+var iconName = 'circle-xmark';
+var width = 512;
+var height = 512;
+var aliases = [61532,"times-circle","xmark-circle"];
+var unicode = 'f057';
+var svgPathData = 'M256 512a256 256 0 1 0 0-512 256 256 0 1 0 0 512zM167 167c9.4-9.4 24.6-9.4 33.9 0l55 55 55-55c9.4-9.4 24.6-9.4 33.9 0s9.4 24.6 0 33.9l-55 55 55 55c9.4 9.4 9.4 24.6 0 33.9s-24.6 9.4-33.9 0l-55-55-55 55c-9.4 9.4-24.6 9.4-33.9 0s-9.4-24.6 0-33.9l55-55-55-55c-9.4-9.4-9.4-24.6 0-33.9z';
+
+exports.definition = {
+  prefix: prefix,
+  iconName: iconName,
+  icon: [
+    width,
+    height,
+    aliases,
+    unicode,
+    svgPathData
+  ]};
+
+exports.faCircleXmark = exports.definition;
+exports.prefix = prefix;
+exports.iconName = iconName;
+exports.width = width;
+exports.height = height;
+exports.ligatures = aliases;
+exports.unicode = unicode;
+exports.svgPathData = svgPathData;
+exports.aliases = aliases;
+});
+
+var source$1 = faCircleXmark;
+
+var faTimesCircle = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+
+exports.definition = {
+  prefix: source$1.prefix,
+  iconName: source$1.iconName,
+  icon: [
+    source$1.width,
+    source$1.height,
+    source$1.aliases,
+    source$1.unicode,
+    source$1.svgPathData
+  ]};
+
+exports.faTimesCircle = exports.definition;
+exports.prefix = source$1.prefix;
+exports.iconName = source$1.iconName;
+exports.width = source$1.width;
+exports.height = source$1.height;
+exports.ligatures = source$1.aliases;
+exports.unicode = source$1.unicode;
+exports.svgPathData = source$1.svgPathData;
+exports.aliases = source$1.aliases;
+});
+
+var faTimesCircle$1 = faTimesCircle;
+
+var faCirclePlus = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+var prefix = 'fas';
+var iconName = 'circle-plus';
+var width = 512;
+var height = 512;
+var aliases = ["plus-circle"];
+var unicode = 'f055';
+var svgPathData = 'M256 512a256 256 0 1 0 0-512 256 256 0 1 0 0 512zM232 344l0-64-64 0c-13.3 0-24-10.7-24-24s10.7-24 24-24l64 0 0-64c0-13.3 10.7-24 24-24s24 10.7 24 24l0 64 64 0c13.3 0 24 10.7 24 24s-10.7 24-24 24l-64 0 0 64c0 13.3-10.7 24-24 24s-24-10.7-24-24z';
+
+exports.definition = {
+  prefix: prefix,
+  iconName: iconName,
+  icon: [
+    width,
+    height,
+    aliases,
+    unicode,
+    svgPathData
+  ]};
+
+exports.faCirclePlus = exports.definition;
+exports.prefix = prefix;
+exports.iconName = iconName;
+exports.width = width;
+exports.height = height;
+exports.ligatures = aliases;
+exports.unicode = unicode;
+exports.svgPathData = svgPathData;
+exports.aliases = aliases;
+});
+
+var source = faCirclePlus;
+
+var faPlusCircle = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+
+exports.definition = {
+  prefix: source.prefix,
+  iconName: source.iconName,
+  icon: [
+    source.width,
+    source.height,
+    source.aliases,
+    source.unicode,
+    source.svgPathData
+  ]};
+
+exports.faPlusCircle = exports.definition;
+exports.prefix = source.prefix;
+exports.iconName = source.iconName;
+exports.width = source.width;
+exports.height = source.height;
+exports.ligatures = source.aliases;
+exports.unicode = source.unicode;
+exports.svgPathData = source.svgPathData;
+exports.aliases = source.aliases;
+});
+
+var faPlusCircle$1 = faPlusCircle;
+
+var faStar = createCommonjsModule$1(function (module, exports) {
+Object.defineProperty(exports, '__esModule', { value: true });
+var prefix = 'fas';
+var iconName = 'star';
+var width = 576;
+var height = 512;
+var aliases = [11088,61446];
+var unicode = 'f005';
+var svgPathData = 'M309.5-18.9c-4.1-8-12.4-13.1-21.4-13.1s-17.3 5.1-21.4 13.1L193.1 125.3 33.2 150.7c-8.9 1.4-16.3 7.7-19.1 16.3s-.5 18 5.8 24.4l114.4 114.5-25.2 159.9c-1.4 8.9 2.3 17.9 9.6 23.2s16.9 6.1 25 2L288.1 417.6 432.4 491c8 4.1 17.7 3.3 25-2s11-14.2 9.6-23.2L441.7 305.9 556.1 191.4c6.4-6.4 8.6-15.8 5.8-24.4s-10.1-14.9-19.1-16.3L383 125.3 309.5-18.9z';
+
+exports.definition = {
+  prefix: prefix,
+  iconName: iconName,
+  icon: [
+    width,
+    height,
+    aliases,
+    unicode,
+    svgPathData
+  ]};
+
+exports.faStar = exports.definition;
+exports.prefix = prefix;
+exports.iconName = iconName;
+exports.width = width;
+exports.height = height;
+exports.ligatures = aliases;
+exports.unicode = unicode;
+exports.svgPathData = svgPathData;
+exports.aliases = aliases;
+});
+
+var faStar$1 = faStar;
+
+/* src/routes/home.svelte generated by Svelte v3.59.2 */
+
+const css = {
+	code: ".wrapper.svelte-smnmm7.svelte-smnmm7{height:100vh;display:grid;justify-items:center;align-items:center}.wrapper.svelte-smnmm7 .hero.svelte-smnmm7{height:100vh;width:100%;display:grid;justify-items:center;align-items:center;grid-auto-rows:max-content;grid-row-gap:3rem;padding-top:5rem}.wrapper.svelte-smnmm7 .hero .settings.svelte-smnmm7{z-index:10;position:absolute;top:0;right:0;color:#fafafa;font-size:1rem;padding:1.5rem}.wrapper.svelte-smnmm7 .hero .settings .btn.svelte-smnmm7{user-select:none;cursor:pointer;color:rgba(255, 255, 255, 0.8)}.wrapper.svelte-smnmm7 .hero .settings .btn.showSettings.svelte-smnmm7{color:white}@media not all and (pointer: coarse){.wrapper.svelte-smnmm7 .hero .settings .btn.svelte-smnmm7:hover{color:white}}.wrapper.svelte-smnmm7 .hero .title.svelte-smnmm7{z-index:10;position:absolute;top:0;color:#fafafa;font-size:1.5rem;max-width:90%;padding:1rem;border-radius:3px;cursor:pointer}.wrapper.svelte-smnmm7 .hero .title .logo.svelte-smnmm7{user-select:none;cursor:pointer;top:5px;position:relative;margin-right:9px}.wrapper.svelte-smnmm7 .hero .title .logo img.svelte-smnmm7{height:2rem}.wrapper.svelte-smnmm7 .hero .title .search input.svelte-smnmm7{margin-left:1rem;padding:0.5rem;border-radius:5px;border:1px solid #ccc;background-color:#333;color:white}.wrapper.svelte-smnmm7 .hero .block.svelte-smnmm7{color:#fafafa;padding:1rem;width:100%;align-self:start}.wrapper.svelte-smnmm7 .hero .block .heading.svelte-smnmm7{font-size:1.5rem}.wrapper.svelte-smnmm7 .hero .block .heading .icon.svelte-smnmm7{top:3px;position:relative;margin-left:8px}.wrapper.svelte-smnmm7 .hero .block .heading .icon.favorite.svelte-smnmm7{color:#fbbc04}.wrapper.svelte-smnmm7 .hero .block .links.svelte-smnmm7{display:none}.wrapper.svelte-smnmm7 .hero .block .items.svelte-smnmm7{display:grid;grid-template-columns:repeat(auto-fill, minmax(250px, 1fr));grid-gap:10px;margin-top:5px}.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper.explore .item.svelte-smnmm7{height:5rem}.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper.noitems.svelte-smnmm7{color:rgb(173.5, 173.5, 173.5);background-color:rgb(25.5, 25.5, 25.5);grid-column:1/-1;border-radius:3px;margin-top:1rem;display:grid;justify-content:center}.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper.noitems .item.svelte-smnmm7{padding:4rem}.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper.noitems .item .inlineicon.svelte-smnmm7{margin:0 4px;top:2px;position:relative;color:white}.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper.noitems .item .key.svelte-smnmm7{color:rgb(173.5, 173.5, 173.5);margin:0 4px;border:1px solid rgb(173.5, 173.5, 173.5);border-radius:3px;top:-1px;position:relative;line-height:1.3rem;padding:0 5px}@media not all and (pointer: coarse){.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper:hover .icon.svelte-smnmm7{opacity:1}}@media not all and (pointer: coarse){.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper:hover span.svelte-smnmm7{opacity:1 !important}}.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper .icon.svelte-smnmm7{position:relative;float:right;margin:1.1rem;opacity:0;color:#fbbc04;font-size:1.3rem}.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper a.svelte-smnmm7{color:#fafafa;text-decoration:none}.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper a .item.svelte-smnmm7{padding:1rem;height:10rem;background-size:cover;background-position:center;border-radius:3px}.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper a .item .subreddit span.svelte-smnmm7{opacity:0}.wrapper.svelte-smnmm7 .hero .block .items .itemwrapper a .item span.svelte-smnmm7{background-color:black;padding:0.3rem;border-radius:3px}.tooltip.svelte-smnmm7.svelte-smnmm7{position:relative;z-index:2;cursor:pointer}.tooltip.svelte-smnmm7.svelte-smnmm7:before,.tooltip.svelte-smnmm7.svelte-smnmm7:after{visibility:hidden;opacity:0;pointer-events:none}.tooltip.svelte-smnmm7.svelte-smnmm7:before{position:absolute;bottom:120%;left:50%;margin-bottom:5px;margin-left:-30px;padding:5px 4px;width:60px;border-radius:3px;background-color:black;color:#fff;background-color:rgba(255, 255, 255, 0.9);color:black;content:attr(data-tooltip);text-align:center;font-size:0.8rem;line-height:1.2}.tooltip.svelte-smnmm7.svelte-smnmm7:after{position:absolute;bottom:120%;left:50%;margin-left:-5px;width:0;border-top:5px solid #000;border-top:5px solid hsla(0, 0%, 20%, 0.9);border-right:5px solid transparent;border-left:5px solid transparent;content:\" \";font-size:0;line-height:0}.tooltip.svelte-smnmm7.svelte-smnmm7:hover:before,.tooltip.svelte-smnmm7.svelte-smnmm7:hover:after{visibility:visible;opacity:1}",
+	map: "{\"version\":3,\"file\":\"home.svelte\",\"sources\":[\"home.svelte\"],\"sourcesContent\":[\"<script>\\n  import Icon from \\\"fa-svelte/src/Icon.svelte\\\";\\n  import { faCog as faSettings } from \\\"@fortawesome/free-solid-svg-icons/faCog\\\";\\n\\n  import { faCloudDownloadAlt as faDownload } from \\\"@fortawesome/free-solid-svg-icons/faCloudDownloadAlt\\\";\\n  import { faEye as faSlideshow } from \\\"@fortawesome/free-solid-svg-icons/faEye\\\";\\n  import { faTimesCircle as faClose } from \\\"@fortawesome/free-solid-svg-icons/faTimesCircle\\\";\\n  import { faPlusCircle } from \\\"@fortawesome/free-solid-svg-icons/faPlusCircle\\\";\\n  import { faStar as faFav } from \\\"@fortawesome/free-solid-svg-icons/faStar\\\";\\n\\n  import Settings from \\\"../components/Settings.svelte\\\";\\n\\n  import { goto as ahref } from \\\"@sapper/app\\\";\\n\\n  import { favorite } from \\\"../_prefs\\\";\\n  favorite.useLocalStorage({});\\n\\n  let showSettings = false;\\n\\n  let exploreTumblrUsers = [\\n    { color: \\\"lightpink\\\", url: \\\"search/art\\\" },\\n    { color: \\\"lightsalmon\\\", url: \\\"search/photography\\\" },\\n    { color: \\\"peachpuff\\\", url: \\\"search/illustration\\\" },\\n    { color: \\\"lavender\\\", url: \\\"search/design\\\" },\\n    { color: \\\"palegreen\\\", url: \\\"search/fashion\\\" },\\n    { color: \\\"turquoise\\\", url: \\\"search/food\\\" },\\n    { color: \\\"wheat\\\", url: \\\"search/travel\\\" },\\n    { color: \\\"lightskyblue\\\", url: \\\"search/music\\\" },\\n    { color: \\\"tomato\\\", url: \\\"search/cats\\\" }\\n  ];\\n\\n  function toggleSettings() {\\n    showSettings = !showSettings;\\n  }\\n\\n  let displayposts = [];\\n  let musers = [];\\n\\n  $: displayposts = $favorite ? Object.entries($favorite) : [];\\n  $: musers = []; // Multi-user not implemented yet\\n  $: slideshowurl = \\\"\\\"; // Multi-user not implemented yet\\n\\n  async function downloadFiles() {\\n    window.open(\\\"/download\\\", \\\"_blank\\\");\\n  }\\n\\n  function openSlideshow() {\\n    ahref(slideshowurl);\\n  }\\n\\n  function removeFav(url) {\\n    $favorite[url] = undefined;\\n    $favorite = JSON.parse(JSON.stringify($favorite));\\n\\n    favorite.set($favorite);\\n  }\\n\\n  function handleKeydown(e) {\\n    if (e.key === 'Enter') {\\n      if (e.target.value.startsWith('/')) {\\n        const search = e.target.value.slice(1);\\n        const searchSegments = search.split('/');\\n        if (searchSegments[0] === 'search' && searchSegments.length > 1) {\\n          const tag = searchSegments.slice(1).join('/');\\n          ahref(`/search/${tag}`);\\n        } else {\\n          ahref(e.target.value);\\n        }\\n      } else {\\n        ahref(`/user/${e.target.value}`);\\n      }\\n    }\\n  }\\n</script>\\n\\n<svelte:head>\\n  <title>redditpx - home</title>\\n</svelte:head>\\n\\n<div class=\\\"wrapper\\\"><div class=\\\"hero\\\"><div class=\\\"title\\\"><span class=\\\"logo\\\"><img alt=\\\"tumblrpx logo\\\" src=\\\"logo-192.png\\\"></span>tumblrpx<div class=\\\"search\\\"><input type=\\\"text\\\" placeholder=\\\"Enter Tumblr username or /search/tags\\\" on:keydown=\\\"{handleKeydown}\\\"></div></div><div class=\\\"settings\\\"><span class=\\\"btn\\\" on:click=\\\"{toggleSettings}\\\" class:showSettings=\\\"{showSettings}\\\"><Icon icon=\\\"{faSettings}\\\"></Icon></span><Settings bind:showSettings=\\\"{showSettings}\\\"></Settings></div><div class=\\\"block multiuser\\\"><div class=\\\"heading\\\">Multi-user {\\\"(\\\" + musers.length + \\\")\\\"}{#if musers.length}<span class=\\\"icon tooltip\\\" on:click=\\\"{openSlideshow}\\\" data-tooltip=\\\"start slideshow\\\" class:favorite=\\\"{musers.length}\\\"><Icon icon=\\\"{faSlideshow}\\\"></Icon></span>{/if}</div><div class=\\\"items\\\">{#each musers as [muser, mrdetails]}<div class=\\\"itemwrapper\\\"><a href=\\\"{`/t/${muser}`}\\\" rel=\\\"prefetch\\\"><div class=\\\"item\\\" style=\\\"background-image: url(&quot;{mrdetails.preview}&quot;)\\\"><span>{muser}</span></div></a></div>{:else}<div class=\\\"itemwrapper noitems\\\"><div class=\\\"item\\\"><span>Add to multi-user using</span><span class=\\\"inlineicon\\\"><Icon icon=\\\"{faPlusCircle}\\\"></Icon></span><span>or using shortcut</span><span class=\\\"key\\\">m</span></div></div>{/each}</div></div><div class=\\\"block favs\\\"><div class=\\\"heading\\\">Favorites {\\\"(\\\" + displayposts.length + \\\")\\\"}{#if displayposts.length}<span class=\\\"icon tooltip\\\" on:click=\\\"{downloadFiles}\\\" data-tooltip=\\\"download all\\\" class:favorite=\\\"{displayposts.length}\\\"><Icon icon=\\\"{faDownload}\\\"></Icon></span>{/if}</div><div class=\\\"items\\\">{#each displayposts as [url, post]}<div class=\\\"itemwrapper\\\"><span class=\\\"icon tooltip\\\" on:click|stopPropagation|preventDefault=\\\"{function() {removeFav(url)}}\\\" data-tooltip=\\\"remove\\\"><Icon icon=\\\"{faClose}\\\"></Icon></span><a href=\\\"{post.url}\\\" target=\\\"_blank\\\"><div class=\\\"item\\\" style=\\\"background-image: url(&quot;{post.preview.img.default}&quot;)\\\"><a class=\\\"subreddit\\\" href=\\\"{`/r/${post.subreddit}`}\\\"><span>{\\\"r/\\\" + post.subreddit}</span></a></div></a></div>{:else}<div class=\\\"itemwrapper noitems\\\"><div class=\\\"item\\\"><span>Add to favorites using</span><span class=\\\"inlineicon\\\"><Icon icon=\\\"{faFav}\\\"></Icon></span><span>or using shortcut</span><span class=\\\"key\\\">x</span></div></div>{/each}</div></div><div class=\\\"block explore\\\"><div class=\\\"heading\\\">Explore</div><div class=\\\"items\\\">{#each exploreSubreddits as subreddit}<div class=\\\"itemwrapper explore\\\"><a href=\\\"{`/${subreddit.url}`}\\\" rel=\\\"prefetch\\\"><div class=\\\"item\\\" style=\\\"background-color: {subreddit.color}\\\"><span>{subreddit.url.replace('search/', '#')}</span></div></a></div>{/each}</div><div class=\\\"links\\\"><a href=\\\"/t/username\\\"></a></div></div></div></div>\\n\\n<style lang=\\\"sass\\\">.wrapper {\\n  height: 100vh;\\n  display: grid;\\n  justify-items: center;\\n  align-items: center;\\n}\\n.wrapper .hero {\\n  height: 100vh;\\n  width: 100%;\\n  display: grid;\\n  justify-items: center;\\n  align-items: center;\\n  grid-auto-rows: max-content;\\n  grid-row-gap: 3rem;\\n  padding-top: 5rem;\\n}\\n.wrapper .hero .settings {\\n  z-index: 10;\\n  position: absolute;\\n  top: 0;\\n  right: 0;\\n  color: #fafafa;\\n  font-size: 1rem;\\n  padding: 1.5rem;\\n}\\n.wrapper .hero .settings .btn {\\n  user-select: none;\\n  cursor: pointer;\\n  color: rgba(255, 255, 255, 0.8);\\n}\\n.wrapper .hero .settings .btn.showSettings {\\n  color: white;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .settings .btn:hover {\\n    color: white;\\n  }\\n}\\n.wrapper .hero .title {\\n  z-index: 10;\\n  position: absolute;\\n  top: 0;\\n  color: #fafafa;\\n  font-size: 1.5rem;\\n  max-width: 90%;\\n  padding: 1rem;\\n  border-radius: 3px;\\n  cursor: pointer;\\n}\\n.wrapper .hero .title .logo {\\n  user-select: none;\\n  cursor: pointer;\\n  top: 5px;\\n  position: relative;\\n  margin-right: 9px;\\n}\\n.wrapper .hero .title .logo img {\\n  height: 2rem;\\n}\\n.wrapper .hero .title .search input {\\n  margin-left: 1rem;\\n  padding: 0.5rem;\\n  border-radius: 5px;\\n  border: 1px solid #ccc;\\n  background-color: #333;\\n  color: white;\\n}\\n.wrapper .hero .block {\\n  color: #fafafa;\\n  padding: 1rem;\\n  width: 100%;\\n  align-self: start;\\n}\\n.wrapper .hero .block .heading {\\n  font-size: 1.5rem;\\n}\\n.wrapper .hero .block .heading .icon {\\n  top: 3px;\\n  position: relative;\\n  margin-left: 8px;\\n}\\n.wrapper .hero .block .heading .icon.favorite {\\n  color: #fbbc04;\\n}\\n.wrapper .hero .block .links {\\n  display: none;\\n}\\n.wrapper .hero .block .items {\\n  display: grid;\\n  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));\\n  grid-gap: 10px;\\n  margin-top: 5px;\\n}\\n.wrapper .hero .block .items .itemwrapper.explore .item {\\n  height: 5rem;\\n}\\n.wrapper .hero .block .items .itemwrapper.noitems {\\n  color: rgb(173.5, 173.5, 173.5);\\n  background-color: rgb(25.5, 25.5, 25.5);\\n  grid-column: 1/-1;\\n  border-radius: 3px;\\n  margin-top: 1rem;\\n  display: grid;\\n  justify-content: center;\\n}\\n.wrapper .hero .block .items .itemwrapper.noitems .item {\\n  padding: 4rem;\\n}\\n.wrapper .hero .block .items .itemwrapper.noitems .item .inlineicon {\\n  margin: 0 4px;\\n  top: 2px;\\n  position: relative;\\n  color: white;\\n}\\n.wrapper .hero .block .items .itemwrapper.noitems .item .key {\\n  color: rgb(173.5, 173.5, 173.5);\\n  margin: 0 4px;\\n  border: 1px solid rgb(173.5, 173.5, 173.5);\\n  border-radius: 3px;\\n  top: -1px;\\n  position: relative;\\n  line-height: 1.3rem;\\n  padding: 0 5px;\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .block .items .itemwrapper:hover .icon {\\n    opacity: 1;\\n  }\\n}\\n@media not all and (pointer: coarse) {\\n  .wrapper .hero .block .items .itemwrapper:hover span {\\n    opacity: 1 !important;\\n  }\\n}\\n.wrapper .hero .block .items .itemwrapper .icon {\\n  position: relative;\\n  float: right;\\n  margin: 1.1rem;\\n  opacity: 0;\\n  color: #fbbc04;\\n  font-size: 1.3rem;\\n}\\n.wrapper .hero .block .items .itemwrapper a {\\n  color: #fafafa;\\n  text-decoration: none;\\n}\\n.wrapper .hero .block .items .itemwrapper a .item {\\n  padding: 1rem;\\n  height: 10rem;\\n  background-size: cover;\\n  background-position: center;\\n  border-radius: 3px;\\n}\\n.wrapper .hero .block .items .itemwrapper a .item .subreddit span {\\n  opacity: 0;\\n}\\n.wrapper .hero .block .items .itemwrapper a .item span {\\n  background-color: black;\\n  padding: 0.3rem;\\n  border-radius: 3px;\\n}\\n\\n.tooltip {\\n  position: relative;\\n  z-index: 2;\\n  cursor: pointer;\\n}\\n\\n.tooltip:before, .tooltip:after {\\n  visibility: hidden;\\n  opacity: 0;\\n  pointer-events: none;\\n}\\n.tooltip:before {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-bottom: 5px;\\n  margin-left: -30px;\\n  padding: 5px 4px;\\n  width: 60px;\\n  border-radius: 3px;\\n  background-color: black;\\n  color: #fff;\\n  background-color: rgba(255, 255, 255, 0.9);\\n  color: black;\\n  content: attr(data-tooltip);\\n  text-align: center;\\n  font-size: 0.8rem;\\n  line-height: 1.2;\\n}\\n.tooltip:after {\\n  position: absolute;\\n  bottom: 120%;\\n  left: 50%;\\n  margin-left: -5px;\\n  width: 0;\\n  border-top: 5px solid #000;\\n  border-top: 5px solid hsla(0, 0%, 20%, 0.9);\\n  border-right: 5px solid transparent;\\n  border-left: 5px solid transparent;\\n  content: \\\" \\\";\\n  font-size: 0;\\n  line-height: 0;\\n}\\n.tooltip:hover:before, .tooltip:hover:after {\\n  visibility: visible;\\n  opacity: 1;\\n}</style>\"],\"names\":[],\"mappings\":\"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\"}"
+};
+
+const Home = create_ssr_component(($$result, $$props, $$bindings, slots) => {
+	let $favorite, $$unsubscribe_favorite;
+	$$unsubscribe_favorite = subscribe(favorite, value => $favorite = value);
+	favorite.useLocalStorage({});
+	let showSettings = false;
+
+	let displayposts = [];
+	let musers = [];
+
+	$$result.css.add(css);
+	let $$settled;
+	let $$rendered;
+
+	do {
+		$$settled = true;
+		displayposts = $favorite ? Object.entries($favorite) : [];
+		musers = []; // Multi-user not implemented yet
+
+		$$rendered = `${($$result.head += '<!-- HEAD_svelte-17ik2xj_START -->' + `${($$result.title = `<title>redditpx - home</title>`, "")}` + '<!-- HEAD_svelte-17ik2xj_END -->', "")}
+
+<div class="wrapper svelte-smnmm7"><div class="hero svelte-smnmm7"><div class="title svelte-smnmm7"><span class="logo svelte-smnmm7"><img alt="tumblrpx logo" src="logo-192.png" class="svelte-smnmm7"></span>tumblrpx<div class="search"><input type="text" placeholder="Enter Tumblr username or /search/tags" class="svelte-smnmm7"></div></div><div class="settings svelte-smnmm7"><span class="${["btn svelte-smnmm7", showSettings ? "showSettings" : ""].join(' ').trim()}">${validate_component(Icon, "Icon").$$render($$result, { icon: faCog$1.faCog }, {}, {})}</span>${validate_component(Settings, "Settings").$$render(
+			$$result,
+			{ showSettings },
+			{
+				showSettings: $$value => {
+					showSettings = $$value;
+					$$settled = false;
+				}
+			},
+			{}
+		)}</div><div class="block multiuser svelte-smnmm7"><div class="heading svelte-smnmm7">Multi-user ${escape("(" + musers.length + ")")}${musers.length
+		? `<span class="${["icon tooltip svelte-smnmm7", musers.length ? "favorite" : ""].join(' ').trim()}" data-tooltip="start slideshow">${validate_component(Icon, "Icon").$$render($$result, { icon: faEye$1.faEye }, {}, {})}</span>`
+		: ``}</div><div class="items svelte-smnmm7">${musers.length
+		? each(musers, ([muser, mrdetails]) => {
+				return `<div class="itemwrapper"><a${add_attribute("href", `/t/${muser}`, 0)} rel="prefetch" class="svelte-smnmm7"><div class="item svelte-smnmm7" style="${"background-image: url(&quot;" + escape(mrdetails.preview, true) + "&quot;)"}"><span class="svelte-smnmm7">${escape(muser)}</span></div></a></div>`;
+			})
+		: `<div class="itemwrapper noitems svelte-smnmm7"><div class="item svelte-smnmm7"><span class="svelte-smnmm7">Add to multi-user using</span><span class="inlineicon svelte-smnmm7">${validate_component(Icon, "Icon").$$render($$result, { icon: faPlusCircle$1.faPlusCircle }, {}, {})}</span><span class="svelte-smnmm7">or using shortcut</span><span class="key svelte-smnmm7">m</span></div></div>`}</div></div><div class="block favs svelte-smnmm7"><div class="heading svelte-smnmm7">Favorites ${escape("(" + displayposts.length + ")")}${displayposts.length
+		? `<span class="${["icon tooltip svelte-smnmm7", displayposts.length ? "favorite" : ""].join(' ').trim()}" data-tooltip="download all">${validate_component(Icon, "Icon").$$render($$result, { icon: faCloudDownloadAlt$1.faCloudDownloadAlt }, {}, {})}</span>`
+		: ``}</div><div class="items svelte-smnmm7">${displayposts.length
+		? each(displayposts, ([url, post]) => {
+				return `<div class="itemwrapper"><span class="icon tooltip svelte-smnmm7" data-tooltip="remove">${validate_component(Icon, "Icon").$$render($$result, { icon: faTimesCircle$1.faTimesCircle }, {}, {})}</span><a${add_attribute("href", post.url, 0)} target="_blank" class="svelte-smnmm7"><div class="item svelte-smnmm7" style="${"background-image: url(&quot;" + escape(post.preview.img.default, true) + "&quot;)"}"><a class="subreddit svelte-smnmm7"${add_attribute("href", `/r/${post.subreddit}`, 0)}><span class="svelte-smnmm7">${escape("r/" + post.subreddit)}</span></a></div></a></div>`;
+			})
+		: `<div class="itemwrapper noitems svelte-smnmm7"><div class="item svelte-smnmm7"><span class="svelte-smnmm7">Add to favorites using</span><span class="inlineicon svelte-smnmm7">${validate_component(Icon, "Icon").$$render($$result, { icon: faStar$1.faStar }, {}, {})}</span><span class="svelte-smnmm7">or using shortcut</span><span class="key svelte-smnmm7">x</span></div></div>`}</div></div><div class="block explore svelte-smnmm7"><div class="heading svelte-smnmm7">Explore</div><div class="items svelte-smnmm7">${each(exploreSubreddits, subreddit => {
+			return `<div class="itemwrapper explore"><a${add_attribute("href", `/${subreddit.url}`, 0)} rel="prefetch" class="svelte-smnmm7"><div class="item svelte-smnmm7" style="${"background-color: " + escape(subreddit.color, true)}"><span class="svelte-smnmm7">${escape(subreddit.url.replace('search/', '#'))}</span></div></a></div>`;
+		})}</div><div class="links svelte-smnmm7"><a href="/t/username" class="svelte-smnmm7"></a></div></div></div></div>`;
+	} while (!$$settled);
+
+	$$unsubscribe_favorite();
+	return $$rendered;
+});
+
+var component_4 = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    'default': Home
+});
+
+/* src/routes/user/[username].svelte generated by Svelte v3.59.2 */
 
 async function preload({ path, params, query }) {
 	if (typeof window === "undefined") return;
-	let blogIdentifier = params.slug;
-	let url = `https://api.tumblr.com/v2/blog/${blogIdentifier}/posts?api_key=${API_KEY}&${queryp(query)}`;
-	let { posts, res, after } = await get_tumblr_posts(url);
+	let blogIdentifier = params.username;
 
-	return {
-		posts,
-		after,
-		res,
-		slugstr: blogIdentifier
-	};
+	// Check if we have a valid API key before making the request
+	{
+		// Return empty data to let the client handle API key setup
+		return {
+			posts: [],
+			after: null,
+			res: {
+				ok: false,
+				res: "Invalid API key. Please set your Tumblr API key in settings."
+			},
+			slugstr: blogIdentifier
+		};
+	}
 }
 
-const U5Bslugu5D = create_ssr_component(($$result, $$props, $$bindings, slots) => {
+const U5Busernameu5D = create_ssr_component(($$result, $$props, $$bindings, slots) => {
 	let $favorite, $$unsubscribe_favorite;
 	let $layout, $$unsubscribe_layout;
 	let $page, $$unsubscribe_page;
@@ -2977,8 +3347,42 @@ const U5Bslugu5D = create_ssr_component(($$result, $$props, $$bindings, slots) =
 
 var component_5 = /*#__PURE__*/Object.freeze({
     __proto__: null,
-    'default': U5Bslugu5D,
+    'default': U5Busernameu5D,
     preload: preload
+});
+
+/* src/routes/t/[slug]/index.svelte generated by Svelte v3.59.2 */
+
+const U5Bslugu5D$1 = create_ssr_component(($$result, $$props, $$bindings, slots) => {
+	let $page, $$unsubscribe_page;
+	const { page } = stores$1();
+	$$unsubscribe_page = subscribe(page, value => $page = value);
+	let { slugstr = $page.params.slug } = $$props;
+	if ($$props.slugstr === void 0 && $$bindings.slugstr && slugstr !== void 0) $$bindings.slugstr(slugstr);
+	$$unsubscribe_page();
+	return `${validate_component(FullscreenLayout, "FullscreenLayout").$$render($$result, { slugstr, params: $page.query }, {}, {})}`;
+});
+
+var component_6 = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    'default': U5Bslugu5D$1
+});
+
+/* src/routes/t/[slug]/[slug].svelte generated by Svelte v3.59.2 */
+
+const U5Bslugu5D = create_ssr_component(($$result, $$props, $$bindings, slots) => {
+	let $page, $$unsubscribe_page;
+	const { page } = stores$1();
+	$$unsubscribe_page = subscribe(page, value => $page = value);
+	let { slugstr = $page.params.slug } = $$props;
+	if ($$props.slugstr === void 0 && $$bindings.slugstr && slugstr !== void 0) $$bindings.slugstr(slugstr);
+	$$unsubscribe_page();
+	return `${validate_component(FullscreenLayout, "FullscreenLayout").$$render($$result, { slugstr, params: $page.query }, {}, {})}`;
+});
+
+var component_7 = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    'default': U5Bslugu5D
 });
 
 // This file is generated by Sapper — do not edit it!
@@ -3016,10 +3420,28 @@ const manifest = {
 		},
 
 		{
+			// search/[tag].svelte
+			pattern: /^\/search\/([^/]+?)\/?$/,
+			parts: [
+				null,
+				{ name: "search_$tag", file: "search/[tag].svelte", component: component_3, params: match => ({ tag: d(match[1]) }) }
+			]
+		},
+
+		{
 			// home.svelte
 			pattern: /^\/home\/?$/,
 			parts: [
-				{ name: "home", file: "home.svelte", component: component_3 }
+				{ name: "home", file: "home.svelte", component: component_4 }
+			]
+		},
+
+		{
+			// user/[username].svelte
+			pattern: /^\/user\/([^/]+?)\/?$/,
+			parts: [
+				null,
+				{ name: "user_$username", file: "user/[username].svelte", component: component_5, params: match => ({ username: d(match[1]) }) }
 			]
 		},
 
@@ -3028,7 +3450,7 @@ const manifest = {
 			pattern: /^\/t\/([^/]+?)\/?$/,
 			parts: [
 				null,
-				{ name: "t_$slug", file: "t/[slug]/index.svelte", component: component_4, params: match => ({ slug: d(match[1]) }) }
+				{ name: "t_$slug", file: "t/[slug]/index.svelte", component: component_6, params: match => ({ slug: d(match[1]) }) }
 			]
 		},
 
@@ -3038,7 +3460,7 @@ const manifest = {
 			parts: [
 				null,
 				null,
-				{ name: "t_$slug$93_$91slug", file: "t/[slug]/[slug].svelte", component: component_5, params: match => ({ slug: d(match[1]), slug: d(match[2]) }) }
+				{ name: "t_$slug$93_$91slug", file: "t/[slug]/[slug].svelte", component: component_7, params: match => ({ slug: d(match[1]), slug: d(match[2]) }) }
 			]
 		}
 	],
@@ -7993,6 +8415,7 @@ polka()
     //  console.log(req.method, req.path);
     //  next();
     //},
+
     sirv("static", { dev }),
     middleware(),
   )
